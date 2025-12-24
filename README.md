@@ -4,6 +4,24 @@
 
 This is a custom Rust compiler implementation that generates native PowerPC assembly with AltiVec SIMD support. **Goal: Port Firefox to PowerPC!**
 
+## ✅ PROVEN WORKING - December 24, 2025
+
+Successfully compiled and executed Rust code on real PowerPC G4 hardware:
+
+```
+$ ./rustc_ppc hello.rs > hello.s
+$ as -o hello.o hello.s
+$ gcc -o hello hello.o
+$ ./hello
+Hello from Rust on PowerPC G4!
+```
+
+**Test Hardware:**
+- Power Mac G4 Dual 1.25 GHz
+- Mac OS X Tiger 10.4.12
+- 2GB RAM
+- gcc 4.0.1 (Apple)
+
 ## What's Included
 
 ### Core Compiler (Opus 4.1)
