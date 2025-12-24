@@ -190,6 +190,39 @@ Tiger doesn't have io_uring or epoll, so async I/O uses `select()` syscall for f
 | Async/await | ✅ Complete |
 | **Firefox build** | **🎯 ALL FEATURES READY!** |
 
+## Building Firefox for PowerPC Tiger
+
+The ultimate goal! Use the included build script:
+
+```bash
+# On your Tiger/Leopard Mac:
+
+# 1. Build the Rust compiler
+gcc -O3 -mcpu=7450 -maltivec -o rustc_ppc rustc_100_percent.c
+gcc -O2 -o rustc_build_system rustc_build_system.c
+
+# 2. Download and build Firefox
+./firefox_ppc_build.sh all
+
+# Or step by step:
+./firefox_ppc_build.sh download   # Get Firefox ESR source
+./firefox_ppc_build.sh patch      # Apply PowerPC patches
+./firefox_ppc_build.sh configure  # Create mozconfig
+./firefox_ppc_build.sh build      # Compile (8-12 hours on G4)
+./firefox_ppc_build.sh package    # Create Firefox.app DMG
+```
+
+**Build times:**
+- G4 dual 1.42 GHz: ~8-12 hours
+- G5 quad 2.5 GHz: ~3-4 hours
+
+**What gets patched:**
+- WebRender → AltiVec SIMD (replaces SSE)
+- encoding_rs → Big-endian fixes
+- parking_lot → PowerPC atomics
+- NSPR/NSS → Tiger compatibility
+- C++ atomics → OSAtomic shims
+
 ## Related Projects
 
 - [ppc-tiger-tools](https://github.com/Scottcjn/ppc-tiger-tools) - Tools for Tiger/Leopard
