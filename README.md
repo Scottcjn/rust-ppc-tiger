@@ -24,6 +24,7 @@ This is a custom Rust compiler implementation that generates native PowerPC asse
 | `rustc_macros.c` | **Full macro_rules! with all built-in macros** | 750+ |
 | `rustc_stdlib_tiger.c` | **Tiger/Leopard stdlib (alloc, I/O, threads)** | 650+ |
 | `rustc_build_system.c` | **Cargo-compatible build orchestration** | 450+ |
+| `rustc_async_await.c` | **Full async/await runtime for Tiger** | 900+ |
 
 ### Language Feature Support
 | File | Feature |
@@ -119,7 +120,7 @@ gcc -o hello hello.o
 - [x] **Full macro_rules! expansion**
 - [x] **Standard library bindings**
 - [x] **Cargo-compatible build system**
-- [ ] Async/await runtime
+- [x] **Async/await runtime**
 
 ## Borrow Checker Details
 
@@ -139,6 +140,31 @@ let y = &x;       // immutable borrow
 let z = &mut x;   // ERROR: cannot borrow as mutable
 println!("{}", y);
 ```
+
+## Async/Await Runtime
+
+The async runtime (`rustc_async_await.c`) implements:
+
+- **State machine generation** - `async fn` transforms to enum states
+- **Future trait** - `poll()` with Pin and Context
+- **Waker/Context** - Task notification system
+- **Executor** - Single-threaded runtime with task queue
+- **Combinators** - `join!` and `select!` for concurrent futures
+- **Async I/O** - select()-based polling for Tiger compatibility
+
+```rust
+// This async function:
+async fn fetch_data() -> String {
+    let response = http_get(url).await;
+    let parsed = parse_json(response).await;
+    parsed.data
+}
+
+// Transforms to a state machine with states:
+// STATE_START -> STATE_AWAIT1 -> STATE_AWAIT2 -> STATE_COMPLETE
+```
+
+Tiger doesn't have io_uring or epoll, so async I/O uses `select()` syscall for fd polling.
 
 ## Why PowerPC?
 
@@ -161,7 +187,8 @@ println!("{}", y);
 | Macro system | ✅ Complete |
 | Std library | ✅ Complete |
 | Build system | ✅ Complete |
-| Firefox build | 🎯 Ready to attempt! |
+| Async/await | ✅ Complete |
+| **Firefox build** | **🎯 ALL FEATURES READY!** |
 
 ## Related Projects
 
