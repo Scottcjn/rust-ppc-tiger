@@ -208,18 +208,50 @@ Tiger doesn't have io_uring or epoll, so async I/O uses `select()` syscall for f
 | Async/await | ✅ Complete |
 | **Firefox build** | **🎯 ALL FEATURES READY!** |
 
-## Building Firefox for PowerPC Tiger
+## Building Pocket Fox (Firefox with Built-in TLS)
 
-The ultimate goal! Use the included build script:
+The ultimate goal! "Pocket Fox" is a minimal Firefox with **built-in mbedTLS**, bypassing Tiger's broken OpenSSL/Python SSL entirely.
+
+### Why Pocket Fox?
+
+Tiger's Python 3.7 lacks SSL support, and the system OpenSSL is too old for modern TLS. Instead of fighting these constraints, we **embed modern TLS directly into Firefox** using mbedTLS 2.28 LTS.
+
+### Quick Build
 
 ```bash
 # On your Tiger/Leopard Mac:
 
 # 1. Build the Rust compiler
 gcc -O3 -mcpu=7450 -maltivec -o rustc_ppc rustc_100_percent.c
-gcc -O2 -o rustc_build_system rustc_build_system.c
 
-# 2. Download and build Firefox
+# 2. Build mbedTLS and SSL bridge
+./build_pocketfox.sh mbedtls   # Build mbedTLS for PowerPC
+./build_pocketfox.sh bridge    # Build SSL bridge library
+./build_pocketfox.sh test      # Test TLS connection
+
+# 3. Build Firefox (after downloading source)
+./build_pocketfox.sh firefox   # Compile with our SSL bridge
+./build_pocketfox.sh package   # Create PocketFox.app DMG
+```
+
+### Architecture
+
+```
+┌─────────────────────────────────────────┐
+│           Pocket Fox Browser            │
+├─────────────────────────────────────────┤
+│  PocketFox SSL Bridge (pocketfox_ssl.h) │
+├─────────────────────────────────────────┤
+│         mbedTLS 2.28 LTS                │
+│    (Portable C, no system deps)         │
+├─────────────────────────────────────────┤
+│     PowerPC Mac OS X Tiger/Leopard      │
+└─────────────────────────────────────────┘
+```
+
+### Legacy Firefox Build (without SSL bridge)
+
+```bash
 ./firefox_ppc_build.sh all
 
 # Or step by step:
