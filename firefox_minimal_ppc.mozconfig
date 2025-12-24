@@ -1,0 +1,110 @@
+# Firefox MINIMAL for PowerPC Mac OS X Tiger
+# "Pocket-sized" - strips everything non-essential
+# Target: ~50MB vs 500MB full Firefox
+
+# Target PowerPC Tiger
+ac_add_options --target=powerpc-apple-darwin8
+ac_add_options --host=powerpc-apple-darwin8
+ac_add_options --with-macos-sdk=/Developer/SDKs/MacOSX10.4u.sdk
+ac_add_options --enable-macos-target=10.4
+
+# Compiler
+export CC="gcc -arch ppc"
+export CXX="g++ -arch ppc"
+export CFLAGS="-Os -mcpu=7450 -maltivec -isysroot /Developer/SDKs/MacOSX10.4u.sdk"
+export CXXFLAGS="-Os -mcpu=7450 -maltivec -isysroot /Developer/SDKs/MacOSX10.4u.sdk"
+export LDFLAGS="-isysroot /Developer/SDKs/MacOSX10.4u.sdk -mmacosx-version-min=10.4 -dead_strip"
+
+# Custom Rust
+export RUSTC="./rustc_ppc"
+export RUSTFLAGS="-C target-cpu=7450 -C opt-level=s"
+
+# ============================================
+# STRIP EVERYTHING NON-ESSENTIAL
+# ============================================
+
+# Core - keep minimal
+ac_add_options --enable-application=browser
+ac_add_options --disable-debug
+ac_add_options --enable-optimize="-Os"
+ac_add_options --enable-strip
+ac_add_options --disable-debug-symbols
+
+# === REMOVE POCKET ===
+ac_add_options --disable-pocket
+
+# === REMOVE TELEMETRY ===
+ac_add_options --disable-telemetry
+ac_add_options --disable-data-collection
+ac_add_options --disable-normandy
+
+# === REMOVE DRM ===
+ac_add_options --disable-eme
+ac_add_options --disable-cdm
+
+# === REMOVE CRASH REPORTING ===
+ac_add_options --disable-crashreporter
+ac_add_options --disable-crash-submitter
+
+# === REMOVE UPDATER ===
+ac_add_options --disable-updater
+ac_add_options --disable-maintenance-service
+
+# === REMOVE WEBRTC (huge) ===
+ac_add_options --disable-webrtc
+
+# === REMOVE ACCESSIBILITY (not needed) ===
+ac_add_options --disable-accessibility
+
+# === REMOVE SANDBOX (Tiger doesn't support it) ===
+ac_add_options --disable-sandbox
+ac_add_options --disable-content-sandbox
+
+# === REMOVE MEDIA CODECS (keep minimal) ===
+ac_add_options --disable-av1
+ac_add_options --disable-webm
+ac_add_options --disable-opus
+ac_add_options --disable-ogg
+ac_add_options --disable-wave
+
+# === REMOVE DEV TOOLS ===
+ac_add_options --disable-devtools
+
+# === REMOVE PDF VIEWER ===
+ac_add_options --disable-pdfjs
+
+# === REMOVE EXTENSIONS ===
+ac_add_options --disable-webextensions
+
+# === REMOVE SYNC ===
+ac_add_options --disable-sync
+
+# === REMOVE SCREENSHOT ===
+ac_add_options --disable-screenshot
+
+# === REMOVE VR ===
+ac_add_options --disable-webvr
+ac_add_options --disable-webxr
+
+# === REMOVE GAMEPAD ===
+ac_add_options --disable-gamepad
+
+# === REMOVE SPEECH ===
+ac_add_options --disable-webspeech
+ac_add_options --disable-webspeechtospeech
+
+# === REMOVE PUSH NOTIFICATIONS ===
+ac_add_options --disable-push
+
+# === KEEP ONLY ESSENTIAL ===
+# Basic HTML/CSS/JS rendering
+# Form handling
+# Cookies
+# Basic SSL/TLS
+
+# Build settings for low memory
+mk_add_options MOZ_MAKE_FLAGS="-j1"
+mk_add_options MOZ_OBJDIR=@TOPSRCDIR@/obj-ppc-minimal
+
+# Minimal branding
+ac_add_options --with-branding=browser/branding/unofficial
