@@ -21,6 +21,9 @@ This is a custom Rust compiler implementation that generates native PowerPC asse
 | `rustc_borrow_checker.c` | **Full ownership/borrowing/NLL** | 500+ |
 | `rustc_functions_traits.c` | **Multi-fn, traits, vtables, monomorphization** | 600+ |
 | `rustc_expressions.c` | **Complex expressions, operators, pattern matching** | 700+ |
+| `rustc_macros.c` | **Full macro_rules! with all built-in macros** | 750+ |
+| `rustc_stdlib_tiger.c` | **Tiger/Leopard stdlib (alloc, I/O, threads)** | 650+ |
+| `rustc_build_system.c` | **Cargo-compatible build orchestration** | 450+ |
 
 ### Language Feature Support
 | File | Feature |
@@ -113,7 +116,9 @@ gcc -o hello hello.o
 - [x] **Complex expression trees**
 - [x] **Method chaining**
 - [x] **Lifetime elision**
-- [ ] Full macro_rules! expansion
+- [x] **Full macro_rules! expansion**
+- [x] **Standard library bindings**
+- [x] **Cargo-compatible build system**
 - [ ] Async/await runtime
 
 ## Borrow Checker Details
@@ -153,8 +158,10 @@ println!("{}", y);
 | Trait dispatch | ✅ Complete |
 | Expression eval | ✅ Complete |
 | AltiVec codegen | ✅ Complete |
-| Std library | 🚧 In progress |
-| Firefox build | 🎯 Target |
+| Macro system | ✅ Complete |
+| Std library | ✅ Complete |
+| Build system | ✅ Complete |
+| Firefox build | 🎯 Ready to attempt! |
 
 ## Related Projects
 
