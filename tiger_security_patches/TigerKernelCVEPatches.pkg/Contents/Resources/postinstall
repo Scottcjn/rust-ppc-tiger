@@ -1,0 +1,14 @@
+#!/bin/bash
+# Configure kernel patches
+
+# Set permissions
+chmod 755 /Library/Security/TigerPatches/*.dylib
+chmod 644 /System/Library/LaunchDaemons/com.elya.dns-randomizer.plist
+
+# Add to system profile
+if ! grep -q "TigerPatches" /etc/profile; then
+    echo "export DYLD_INSERT_LIBRARIES=/Library/Security/TigerPatches/TCPSecurity.dylib:/Library/Security/TigerPatches/IOKitSecurity.dylib" >> /etc/profile
+fi
+
+echo "Kernel patches installed. Reboot required."
+exit 0
