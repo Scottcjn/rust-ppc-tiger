@@ -126,9 +126,10 @@ sudo reboot
 
 ## Credits
 
-- **Scott (Scottcjn)** - Project lead, hardware lab, testing, direction
-- **Opus 4.1** - Implementation assistance
-- **Opus 4.5** - Documentation and warnings
+- **Scott (Scottcjn)** - Creator, architect, hardware lab, testing
+- **Claude (Opus 4.1/4.5)** - Implementation assistance
+
+*Designed by Scott, coded with Claude*
 
 ## License
 

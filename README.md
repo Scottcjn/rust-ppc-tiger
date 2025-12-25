@@ -391,8 +391,10 @@ gcc -O3 -mcpu=7450 -maltivec -o rustc_ppc rustc_100_percent.c
 
 ## Contributors
 
-- **Opus 4.1** - Core compiler (rustc_100_percent.c)
-- **Opus 4.5** - Borrow checker, traits, expressions
+- **Scott (Scottcjn)** - Creator, architect, hardware lab, testing, project direction
+- **Claude (Opus 4.1/4.5)** - Implementation assistance
+
+*Designed by Scott, coded with Claude*
 
 ## Attribution
 

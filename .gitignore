@@ -1,0 +1,12 @@
+# Large source archives (download fresh)
+*.tar.gz
+*.tar.xz
+*.tar.bz2
+
+# Mac stuff
+.DS_Store
+*.dSYM/
+
+# Build artifacts (local only)
+*.o
+*.a
