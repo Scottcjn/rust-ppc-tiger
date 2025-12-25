@@ -22,6 +22,10 @@
 #include <time.h>
 #include <errno.h>
 
+/* Global for redirect handling */
+char g_redirect_url[2048] = {0};
+#define MAX_REDIRECTS 5
+
 /* Forward declarations from pocketfox_ssl_tiger.c */
 typedef struct PocketFoxSSL PocketFoxSSL;
 extern int pocketfox_ssl_init(void);
@@ -171,7 +175,12 @@ static int download_https(const char* host, int port, const char* path,
             loc += 10;
             char* end = strstr(loc, "\r\n");
             if (end) *end = '\0';
-            fprintf(stderr, "wget: Redirecting to %s\n", loc);
+            if (!quiet) {
+                fprintf(stderr, "Redirecting to %s\n", loc);
+            }
+            /* Store redirect URL for caller */
+            extern char g_redirect_url[2048];
+            strncpy(g_redirect_url, loc, sizeof(g_redirect_url) - 1);
         }
         pocketfox_ssl_close(ssl);
         pocketfox_ssl_free(ssl);
@@ -191,7 +200,15 @@ static int download_https(const char* host, int port, const char* path,
         *content_length = atol(cl + 16);
     }
 
-    if (!quiet && *content_length > 0) {
+    /* Check for chunked transfer encoding */
+    int chunked = 0;
+    if (strstr(header_buf, "Transfer-Encoding: chunked") != NULL ||
+        strstr(header_buf, "transfer-encoding: chunked") != NULL) {
+        chunked = 1;
+        if (!quiet) {
+            fprintf(stderr, "Length: unspecified [chunked]\n");
+        }
+    } else if (!quiet && *content_length > 0) {
         fprintf(stderr, "Length: %ld", *content_length);
         if (*content_length > 1024*1024) {
             fprintf(stderr, " (%.1fM)", *content_length / (1024.0*1024.0));
@@ -207,31 +224,80 @@ static int download_https(const char* host, int port, const char* path,
     time_t start_time = time(NULL);
     time_t last_progress = start_time;
 
-    while (1) {
-        int n = pocketfox_ssl_read(ssl, buf, sizeof(buf));
-        if (n <= 0) break;
-
-        fwrite(buf, 1, n, output);
-        total += n;
-
-        /* Progress indicator */
-        if (!quiet) {
-            time_t now = time(NULL);
-            if (now != last_progress) {
-                last_progress = now;
-                if (*content_length > 0) {
-                    int pct = (int)(100.0 * total / *content_length);
-                    fprintf(stderr, "\r%3d%% [", pct);
-                    int bars = pct / 5;
-                    int i;
-                    for (i = 0; i < 20; i++) {
-                        fprintf(stderr, i < bars ? "=" : " ");
-                    }
-                    fprintf(stderr, "] %ld/%ld", total, *content_length);
-                } else {
-                    fprintf(stderr, "\r%ld bytes received", total);
+    if (chunked) {
+        /* Handle chunked transfer encoding */
+        while (1) {
+            /* Read chunk size line */
+            char size_line[32];
+            int si = 0;
+            while (si < 31) {
+                int n = pocketfox_ssl_read(ssl, (unsigned char*)&size_line[si], 1);
+                if (n <= 0) break;
+                if (size_line[si] == '\n') {
+                    size_line[si] = '\0';
+                    break;
                 }
-                fflush(stderr);
+                si++;
+            }
+            size_line[si] = '\0';
+
+            /* Parse chunk size (hex) */
+            long chunk_size = strtol(size_line, NULL, 16);
+            if (chunk_size <= 0) break;  /* End of chunks */
+
+            /* Read chunk data */
+            long chunk_read = 0;
+            while (chunk_read < chunk_size) {
+                int to_read = (chunk_size - chunk_read > sizeof(buf)) ? sizeof(buf) : (chunk_size - chunk_read);
+                int n = pocketfox_ssl_read(ssl, buf, to_read);
+                if (n <= 0) break;
+                fwrite(buf, 1, n, output);
+                chunk_read += n;
+                total += n;
+
+                /* Progress */
+                if (!quiet) {
+                    time_t now = time(NULL);
+                    if (now != last_progress) {
+                        last_progress = now;
+                        fprintf(stderr, "\r%ld bytes received", total);
+                        fflush(stderr);
+                    }
+                }
+            }
+
+            /* Read trailing CRLF after chunk */
+            char crlf[2];
+            pocketfox_ssl_read(ssl, (unsigned char*)crlf, 2);
+        }
+    } else {
+        /* Regular (non-chunked) download */
+        while (1) {
+            int n = pocketfox_ssl_read(ssl, buf, sizeof(buf));
+            if (n <= 0) break;
+
+            fwrite(buf, 1, n, output);
+            total += n;
+
+            /* Progress indicator */
+            if (!quiet) {
+                time_t now = time(NULL);
+                if (now != last_progress) {
+                    last_progress = now;
+                    if (*content_length > 0) {
+                        int pct = (int)(100.0 * total / *content_length);
+                        fprintf(stderr, "\r%3d%% [", pct);
+                        int bars = pct / 5;
+                        int i;
+                        for (i = 0; i < 20; i++) {
+                            fprintf(stderr, i < bars ? "=" : " ");
+                        }
+                        fprintf(stderr, "] %ld/%ld", total, *content_length);
+                    } else {
+                        fprintf(stderr, "\r%ld bytes received", total);
+                    }
+                    fflush(stderr);
+                }
             }
         }
     }
@@ -439,16 +505,41 @@ int main(int argc, char** argv) {
     /* Initialize SSL */
     pocketfox_ssl_init();
 
-    /* Download */
+    /* Download with redirect following */
     long content_length = 0;
     int ret;
+    int redirects = 0;
 
-    if (strcmp(parsed.scheme, "https") == 0) {
-        ret = download_https(parsed.host, parsed.port, parsed.path,
-                            output, quiet, &content_length);
-    } else {
-        ret = download_http(parsed.host, parsed.port, parsed.path,
-                           output, quiet, &content_length);
+    do {
+        g_redirect_url[0] = '\0';  /* Clear redirect URL */
+
+        if (strcmp(parsed.scheme, "https") == 0) {
+            ret = download_https(parsed.host, parsed.port, parsed.path,
+                                output, quiet, &content_length);
+        } else {
+            ret = download_http(parsed.host, parsed.port, parsed.path,
+                               output, quiet, &content_length);
+        }
+
+        /* Handle redirect */
+        if (ret == -2 && g_redirect_url[0] != '\0' && redirects < MAX_REDIRECTS) {
+            redirects++;
+            if (!parse_url(g_redirect_url, &parsed)) {
+                fprintf(stderr, "wget: Invalid redirect URL: %s\n", g_redirect_url);
+                ret = -1;
+                break;
+            }
+            /* Reopen output file if needed (truncate) */
+            if (output != stdout) {
+                fseek(output, 0, SEEK_SET);
+                ftruncate(fileno(output), 0);
+            }
+        }
+    } while (ret == -2 && redirects < MAX_REDIRECTS);
+
+    if (ret == -2) {
+        fprintf(stderr, "wget: Too many redirects\n");
+        ret = -1;
     }
 
     if (output != stdout) {
