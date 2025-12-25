@@ -314,7 +314,7 @@ cd tiger_security_patches
 open TigerKernelPatches.dmg
 ```
 
-**Credits:** Opus 4.1 (implementation), Opus 4.5 (documentation)
+**Credits:** Scott (project lead), Opus 4.1 (implementation), Opus 4.5 (documentation)
 
 ---
 
