@@ -208,6 +208,88 @@ Tiger doesn't have io_uring or epoll, so async I/O uses `select()` syscall for f
 | Async/await | ✅ Complete |
 | **Firefox build** | **🎯 ALL FEATURES READY!** |
 
+## Tiger Tools with Modern HTTPS
+
+We've built several tools that bring modern TLS 1.2 to Tiger using mbedTLS:
+
+### wget for Tiger ✅ WORKING
+
+Full wget implementation with HTTPS support:
+
+```bash
+# Build
+gcc -arch ppc -std=c99 -O2 -DHAVE_MBEDTLS \
+    -I./mbedtls-2.28.8/include -o wget \
+    wget_tiger.c pocketfox_ssl_tiger.c \
+    -L./mbedtls-2.28.8/library -lmbedtls -lmbedx509 -lmbedcrypto
+
+# Usage
+./wget https://example.com/file.tar.gz
+./wget -O output.txt https://site.com/page
+./wget -q https://api.github.com/repos  # quiet mode
+```
+
+**Features:**
+- TLS 1.2 with ChaCha20-Poly1305 cipher
+- Progress bar with percentage
+- HTTP and HTTPS support
+- Auto-extracts filename from URL
+
+### PocketFox SSL Test Tool ✅ WORKING
+
+Command-line HTTPS tester:
+
+```bash
+# Build
+gcc -arch ppc -std=c99 -O2 -DHAVE_MBEDTLS -DTEST_STANDALONE \
+    -I./mbedtls-2.28.8/include -o pocketfox_ssl \
+    pocketfox_ssl_tiger.c \
+    -L./mbedtls-2.28.8/library -lmbedtls -lmbedx509 -lmbedcrypto
+
+# Usage
+./pocketfox_ssl example.com
+./pocketfox_ssl google.com
+```
+
+### PocketFox Browser (GUI)
+
+Native Cocoa browser with built-in TLS:
+
+```bash
+# Build (2-stage for Tiger compatibility)
+gcc -arch ppc -std=c99 -O2 -DHAVE_MBEDTLS \
+    -I./mbedtls-2.28.8/include -c pocketfox_ssl_tiger.c -o pocketfox_ssl.o
+
+gcc -arch ppc -O2 -DHAVE_MBEDTLS -framework Cocoa \
+    -I./mbedtls-2.28.8/include -o PocketFox \
+    pocketfox_tiger_gui.m pocketfox_ssl.o \
+    -L./mbedtls-2.28.8/library -lmbedtls -lmbedx509 -lmbedcrypto
+
+# Create app bundle
+mkdir -p PocketFox.app/Contents/MacOS
+cp PocketFox PocketFox.app/Contents/MacOS/
+```
+
+### Building mbedTLS for Tiger
+
+```bash
+# Download mbedTLS 2.28 LTS
+curl -L -o mbedtls.tar.gz https://github.com/Mbed-TLS/mbedtls/archive/v2.28.8.tar.gz
+tar xzf mbedtls.tar.gz
+cd mbedtls-2.28.8/library
+
+# Compile for PowerPC
+gcc -arch ppc -std=c99 -O2 -mcpu=7450 -I../include \
+    -DMBEDTLS_NO_PLATFORM_ENTROPY -c *.c
+
+# Create libraries
+ar rcs libmbedcrypto.a aes.o arc4.o aria.o base64.o bignum.o ... certs.o
+ar rcs libmbedx509.a x509*.o
+ar rcs libmbedtls.a ssl*.o debug.o net_sockets.o
+```
+
+---
+
 ## Building Pocket Fox (Firefox with Built-in TLS)
 
 The ultimate goal! "Pocket Fox" is a minimal Firefox with **built-in mbedTLS**, bypassing Tiger's broken OpenSSL/Python SSL entirely.
