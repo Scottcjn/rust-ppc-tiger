@@ -284,10 +284,28 @@ gcc -O3 -mcpu=7450 -maltivec -o rustc_ppc rustc_100_percent.c
 - **Opus 4.1** - Core compiler (rustc_100_percent.c)
 - **Opus 4.5** - Borrow checker, traits, expressions
 
+## Attribution
+
+**A year of development, real hardware, electricity bills, and a dedicated lab went into this.**
+
+If you use this project, please give credit:
+
+```
+Rust for PowerPC Tiger by Scott (Scottcjn)
+https://github.com/Scottcjn/rust-ppc-tiger
+```
+
+If this helped you, please:
+- ⭐ **Star this repo** - It helps others find it
+- 📝 **Credit in your project** - Keep the attribution
+- 🔗 **Link back** - Share the love
+
 ## License
 
-MIT License
+MIT License - Free to use, but please keep the copyright notice and attribution.
 
 ---
 
 *"Rust on your 2005 Power Mac. Firefox is next."*
+
+**73 clones and 0 stars? Come on, hit that star button!** ⭐
