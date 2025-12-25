@@ -19,7 +19,16 @@ fi
 # Download curl if needed
 if [ ! -d "curl-$CURL_VERSION" ]; then
     echo "Downloading curl $CURL_VERSION..."
-    curl -L -o curl.tar.gz "https://curl.se/download/curl-$CURL_VERSION.tar.gz"
+    # Use our TLS 1.2 wget - Tiger's curl can't do HTTPS!
+    if [ -x /usr/local/bin/wget ]; then
+        /usr/local/bin/wget -O curl.tar.gz "https://curl.se/download/curl-$CURL_VERSION.tar.gz"
+    elif [ -x ./wget ]; then
+        ./wget -O curl.tar.gz "https://curl.se/download/curl-$CURL_VERSION.tar.gz"
+    else
+        echo "ERROR: wget with TLS support not found"
+        echo "Build wget_tiger first!"
+        exit 1
+    fi
     tar xzf curl.tar.gz
 fi
 

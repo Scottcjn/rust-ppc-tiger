@@ -210,7 +210,19 @@ Tiger doesn't have io_uring or epoll, so async I/O uses `select()` syscall for f
 
 ## Tiger Tools with Modern HTTPS
 
-We've built several tools that bring modern TLS 1.2 to Tiger using mbedTLS:
+We've built several tools that bring modern TLS 1.2 to Tiger using mbedTLS.
+
+### Build Order (IMPORTANT!)
+
+Build these in order - each depends on previous:
+
+| Step | Tool | Script | What it does |
+|------|------|--------|--------------|
+| 1 | mbedTLS | (see below) | TLS 1.2 crypto library |
+| 2 | wget | (manual compile) | Download files over HTTPS |
+| 3 | OpenSSH | `build_openssh_tiger.sh` | Modern SSH client/server |
+| 4 | curl | `build_curl_mbedtls.sh` | HTTP library with TLS |
+| 5 | rsync | `build_rsync_tiger.sh` | Secure file sync |
 
 ### wget for Tiger ✅ WORKING
 
@@ -286,6 +298,42 @@ gcc -arch ppc -std=c99 -O2 -mcpu=7450 -I../include \
 ar rcs libmbedcrypto.a aes.o arc4.o aria.o base64.o bignum.o ... certs.o
 ar rcs libmbedx509.a x509*.o
 ar rcs libmbedtls.a ssl*.o debug.o net_sockets.o
+```
+
+### OpenSSH 9.6 for Tiger
+
+Tiger ships with OpenSSH 4.5 which has critical vulnerabilities. Build modern OpenSSH:
+
+```bash
+# Build (uses wget to download, compiles LibreSSL + OpenSSH)
+./build_openssh_tiger.sh
+
+# After install, new SSH at /usr/local/bin/ssh
+# Replaces vulnerable CVE-2016-0777, CVE-2016-0778, CVE-2015-5600, etc.
+```
+
+See `openssh_tiger.md` for details.
+
+### rsync 3.2 for Tiger
+
+Modern rsync with xxHash for fast checksums:
+
+```bash
+./build_rsync_tiger.sh
+
+# Sync files securely
+/usr/local/bin/rsync -avz ~/Documents/ /Volumes/Backup/
+```
+
+### curl with mbedTLS
+
+For git HTTPS support and other tools:
+
+```bash
+./build_curl_mbedtls.sh
+
+# Test
+/usr/local/bin/curl https://github.com
 ```
 
 ---
