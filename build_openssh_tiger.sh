@@ -10,12 +10,20 @@ PREFIX="/usr/local"
 
 echo "=== Building OpenSSH $OPENSSH_VERSION with LibreSSL $LIBRESSL_VERSION for Tiger ==="
 
-# Check for wget (our custom one with TLS 1.2)
-if [ ! -x /usr/local/bin/wget ]; then
-    echo "ERROR: wget with TLS support not found"
-    echo "Please build wget_tiger first"
+# Check for download tool (wget or curl with TLS)
+DOWNLOAD=""
+if [ -x /usr/local/bin/wget ]; then
+    DOWNLOAD="/usr/local/bin/wget -O"
+elif [ -x /opt/local/bin/curl ]; then
+    DOWNLOAD="/opt/local/bin/curl -L -o"
+elif [ -x /usr/local/bin/curl ]; then
+    DOWNLOAD="/usr/local/bin/curl -L -o"
+else
+    echo "ERROR: No download tool with TLS support found"
+    echo "Install MacPorts curl or build wget_tiger"
     exit 1
 fi
+echo "Using download tool: $DOWNLOAD"
 
 # Create build directory
 mkdir -p ~/openssh_build
@@ -29,7 +37,7 @@ echo "=== Step 1: Building LibreSSL $LIBRESSL_VERSION ==="
 
 if [ ! -f "libressl-$LIBRESSL_VERSION.tar.gz" ]; then
     echo "Downloading LibreSSL..."
-    /usr/local/bin/wget -O libressl-$LIBRESSL_VERSION.tar.gz \
+    $DOWNLOAD libressl-$LIBRESSL_VERSION.tar.gz \
         "https://ftp.openbsd.org/pub/OpenBSD/LibreSSL/libressl-$LIBRESSL_VERSION.tar.gz"
 fi
 
@@ -68,7 +76,7 @@ echo "=== Step 2: Building OpenSSH $OPENSSH_VERSION ==="
 
 if [ ! -f "openssh-$OPENSSH_VERSION.tar.gz" ]; then
     echo "Downloading OpenSSH..."
-    /usr/local/bin/wget -O openssh-$OPENSSH_VERSION.tar.gz \
+    $DOWNLOAD openssh-$OPENSSH_VERSION.tar.gz \
         "https://cdn.openbsd.org/pub/OpenBSD/OpenSSH/portable/openssh-$OPENSSH_VERSION.tar.gz"
 fi
 
