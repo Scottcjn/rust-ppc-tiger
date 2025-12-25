@@ -290,6 +290,34 @@ ar rcs libmbedtls.a ssl*.o debug.o net_sockets.o
 
 ---
 
+## Tiger Security Patches (EXPERIMENTAL)
+
+CVE patches for Mac OS X Tiger - bringing modern security fixes to 20-year-old Macs.
+
+**WARNING: These patches are EXPERIMENTAL and have not been tested on all PowerPC Macs. See `tiger_security_patches/README.md` for details.**
+
+### CVEs Addressed:
+| CVE | Description | Method |
+|-----|-------------|--------|
+| CVE-2008-1447 | DNS cache poisoning (Kaminsky) | Port randomization |
+| CVE-2009-2414 | TCP ISN hijacking | ISN randomization |
+| CVE-2010-0036 | HFS+ integer overflow | Bounds checking |
+| CVE-2011-0182 | Font parsing RCE | Input validation |
+| CVE-2014-4377 | IOKit privilege escalation | Bounds checking |
+
+```bash
+# Install (after backup!)
+cd tiger_security_patches
+./BUILD_KERNEL_PKG.sh
+
+# Then run the installer
+open TigerKernelPatches.dmg
+```
+
+**Credits:** Opus 4.1 (implementation), Opus 4.5 (documentation)
+
+---
+
 ## Building Pocket Fox (Firefox with Built-in TLS)
 
 The ultimate goal! "Pocket Fox" is a minimal Firefox with **built-in mbedTLS**, bypassing Tiger's broken OpenSSL/Python SSL entirely.
