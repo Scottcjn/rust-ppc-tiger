@@ -460,3 +460,10 @@ The clone-to-star ratio is the purest form of underground validation. We see you
 
 <!-- Analytics -->
 ![](http://50.28.86.131:9090/pixel/rust-ppc-tiger.gif)
+
+
+## 中文简介
+
+Elyan Labs 复古计算项目 - 为 PowerPC 和 SPARC 系统提供现代支持。
+
+Contributed by eelaine-wzw
