@@ -213,7 +213,10 @@ def download_crate(name, version, dest_dir, checksum=None):
             for member in tar.getmembers():
                 if member.name.startswith('/') or '..' in member.name:
                     return None, f"suspicious path in tarball: {member.name}"
-            tar.extractall(path=dest_dir)
+            if sys.version_info >= (3, 12):
+                tar.extractall(path=dest_dir, filter='data')
+            else:
+                tar.extractall(path=dest_dir)
     except tarfile.TarError as e:
         return None, f"extract failed: {e}"
 
