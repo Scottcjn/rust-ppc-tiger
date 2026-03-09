@@ -1801,8 +1801,27 @@ void compile_rust(char* source) {
                 while (*pos && *pos != '}') {
                     skip_whitespace();
                     if (*pos == '}') break;
+                    /* Skip comments inside struct */
+                    if (*pos == '/' && *(pos+1) == '/') {
+                        while (*pos && *pos != '\n') pos++;
+                        if (*pos == '\n') pos++;
+                        continue;
+                    }
+                    if (*pos == '/' && *(pos+1) == '*') {
+                        pos += 2;
+                        while (*pos && !(*pos == '*' && *(pos+1) == '/')) pos++;
+                        if (*pos) pos += 2;
+                        continue;
+                    }
+                    /* Skip attributes like #[...] */
+                    if (*pos == '#' && *(pos+1) == '[') {
+                        while (*pos && *pos != ']') pos++;
+                        if (*pos == ']') pos++;
+                        continue;
+                    }
                     /* Skip pub keyword */
                     if (strncmp(pos, "pub ", 4) == 0) pos += 4;
+                    if (strncmp(pos, "pub(crate) ", 11) == 0) pos += 11;
                     skip_whitespace();
                     /* Parse field name */
                     char fname[32] = {0};
@@ -1911,6 +1930,24 @@ void compile_rust(char* source) {
                 while (*pos && *pos != '}') {
                     skip_whitespace();
                     if (*pos == '}') break;
+                    /* Skip comments inside enum */
+                    if (*pos == '/' && *(pos+1) == '/') {
+                        while (*pos && *pos != '\n') pos++;
+                        if (*pos == '\n') pos++;
+                        continue;
+                    }
+                    if (*pos == '/' && *(pos+1) == '*') {
+                        pos += 2;
+                        while (*pos && !(*pos == '*' && *(pos+1) == '/')) pos++;
+                        if (*pos) pos += 2;
+                        continue;
+                    }
+                    /* Skip attributes */
+                    if (*pos == '#' && *(pos+1) == '[') {
+                        while (*pos && *pos != ']') pos++;
+                        if (*pos == ']') pos++;
+                        continue;
+                    }
                     /* Parse variant name */
                     char vname[32] = {0};
                     int vi = 0;
@@ -1938,6 +1975,18 @@ void compile_rust(char* source) {
                         while (*pos && *pos != '}') {
                             skip_whitespace();
                             if (*pos == '}') break;
+                            /* Skip comments */
+                            if (*pos == '/' && *(pos+1) == '/') {
+                                while (*pos && *pos != '\n') pos++;
+                                if (*pos == '\n') pos++;
+                                continue;
+                            }
+                            if (*pos == '/' && *(pos+1) == '*') {
+                                pos += 2;
+                                while (*pos && !(*pos == '*' && *(pos+1) == '/')) pos++;
+                                if (*pos) pos += 2;
+                                continue;
+                            }
                             while (*pos && *pos != ':' && *pos != '}') pos++;
                             if (*pos == ':') { pos++; skip_whitespace(); parse_type(); payload_size += 4; }
                             skip_whitespace();
