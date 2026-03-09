@@ -40,6 +40,7 @@ typedef struct {
     char sysroot[256];
     char linker[256];
     char vendor_dir[MAX_PATH_LEN];
+    char rustc_ppc[MAX_PATH_LEN];  /* resolved path to rustc_ppc binary */
     int use_manifest;       /* 1 = read build_manifest.json */
     int dry_run;            /* 1 = print commands, don't execute */
     int verbose;
@@ -544,16 +545,18 @@ void compile_crate(BuildContext* ctx, Crate* crate) {
 
         /* Compile: .rs → .s */
         char cmd[2048];
+        /* rustc_ppc outputs assembly to stdout, redirect to file */
         snprintf(cmd, sizeof(cmd),
-                "./rustc_ppc %s -o %s "
+                "%s %s "
                 "-C target-cpu=%s "
                 "-C opt-level=%s "
-                "%s %s",
-                src, asm_path,
+                "%s %s > %s",
+                ctx->config.rustc_ppc, src,
                 ctx->config.cpu,
                 ctx->config.opt_level,
                 ctx->config.altivec ? "-C target-feature=+altivec" : "",
-                ctx->config.debug_info ? "-g" : "");
+                ctx->config.debug_info ? "-g" : "",
+                asm_path);
 
         if (ctx->config.verbose || ctx->config.dry_run)
             printf(";   $ %s\n", cmd);
@@ -684,6 +687,9 @@ void build_project(BuildContext* ctx, const char* project_dir) {
     strcpy(ctx->config.cpu, "7450");
     ctx->config.altivec = 1;
     ctx->config.debug_info = 0;
+    /* If rustc_ppc path not set by main(), default to ./rustc_ppc */
+    if (!ctx->config.rustc_ppc[0])
+        strcpy(ctx->config.rustc_ppc, "./rustc_ppc");
     snprintf(ctx->output_dir, sizeof(ctx->output_dir),
              "%s/target/powerpc-apple-darwin8/release", project_dir);
 
@@ -698,6 +704,10 @@ void build_project(BuildContext* ctx, const char* project_dir) {
                  "%s/vendor/build_manifest.json", project_dir);
     }
 
+    /* Save user-specified vendor dir before manifest overwrites it */
+    char user_vendor_dir[MAX_PATH_LEN] = "";
+    strncpy(user_vendor_dir, ctx->config.vendor_dir, MAX_PATH_LEN-1);
+
     if (access(manifest_path, F_OK) == 0) {
         printf("; Loading build manifest: %s\n", manifest_path);
         if (!load_manifest(ctx, manifest_path)) {
@@ -705,6 +715,76 @@ void build_project(BuildContext* ctx, const char* project_dir) {
             return;
         }
         ctx->config.use_manifest = 1;
+
+        /* Remap paths: manifest was generated on a different machine.
+         * Replace the manifest's vendor_dir prefix with the actual
+         * vendor dir on THIS machine. */
+        {
+            /* Resolve actual vendor dir on this machine */
+            char actual_vendor[MAX_PATH_LEN];
+            char cwd[MAX_PATH_LEN];
+            getcwd(cwd, sizeof(cwd));
+
+            if (user_vendor_dir[0]) {
+                if (user_vendor_dir[0] == '/') {
+                    strncpy(actual_vendor, user_vendor_dir, MAX_PATH_LEN-1);
+                } else {
+                    snprintf(actual_vendor, sizeof(actual_vendor), "%s/%s",
+                             cwd, user_vendor_dir);
+                }
+            } else {
+                snprintf(actual_vendor, sizeof(actual_vendor), "%s/vendor", cwd);
+            }
+
+            /* The manifest's vendor_dir was set from the generating machine */
+            char manifest_vendor[MAX_PATH_LEN] = "";
+            strncpy(manifest_vendor, ctx->config.vendor_dir, MAX_PATH_LEN-1);
+
+            if (manifest_vendor[0] && strcmp(manifest_vendor, actual_vendor) != 0) {
+                int prefix_len = strlen(manifest_vendor);
+                printf("; Path remap: %s -> %s\n", manifest_vendor, actual_vendor);
+
+                /* Also compute project dir remap (vendor parent = project) */
+                char manifest_project[MAX_PATH_LEN] = "";
+                strncpy(manifest_project, manifest_vendor, MAX_PATH_LEN-1);
+                char* vslash = strrchr(manifest_project, '/');
+                if (vslash) *vslash = '\0';
+                int proj_prefix_len = strlen(manifest_project);
+
+                for (int i = 0; i < ctx->crate_count; i++) {
+                    /* Remap crate path */
+                    if (strncmp(ctx->crates[i].path, manifest_vendor, prefix_len) == 0) {
+                        char new_path[MAX_PATH_LEN];
+                        snprintf(new_path, sizeof(new_path), "%s%s",
+                                actual_vendor, ctx->crates[i].path + prefix_len);
+                        strncpy(ctx->crates[i].path, new_path, MAX_PATH_LEN-1);
+                    }
+
+                    /* Remap source file paths */
+                    for (int j = 0; j < ctx->crates[i].source_count; j++) {
+                        char* sf = ctx->crates[i].source_files[j];
+                        if (strncmp(sf, manifest_vendor, prefix_len) == 0) {
+                            char new_src[MAX_PATH_LEN];
+                            snprintf(new_src, sizeof(new_src), "%s%s",
+                                    actual_vendor, sf + prefix_len);
+                            free(ctx->crates[i].source_files[j]);
+                            ctx->crates[i].source_files[j] = strdup(new_src);
+                        } else if (strncmp(sf, manifest_project, proj_prefix_len) == 0) {
+                            /* Remap project src/ paths too */
+                            char new_src[MAX_PATH_LEN];
+                            snprintf(new_src, sizeof(new_src), "%s%s",
+                                    cwd, sf + proj_prefix_len);
+                            free(ctx->crates[i].source_files[j]);
+                            ctx->crates[i].source_files[j] = strdup(new_src);
+                        }
+                    }
+                }
+
+                /* Update vendor_dir to actual */
+                strncpy(ctx->config.vendor_dir, actual_vendor, MAX_PATH_LEN-1);
+            }
+        }
+
         printf("; Loaded %d crates from manifest\n", ctx->crate_count);
     } else {
         /* Fall back to Cargo.toml parsing */
@@ -895,6 +975,19 @@ int main(int argc, char** argv) {
     if (strcmp(argv[1], "build") == 0) {
         BuildContext* ctx = ctx_new();
         const char* project_dir = ".";
+
+        /* Resolve rustc_ppc path relative to build system binary */
+        {
+            char self_path[MAX_PATH_LEN];
+            strncpy(self_path, argv[0], MAX_PATH_LEN-1);
+            char* last_slash = strrchr(self_path, '/');
+            if (last_slash) {
+                *(last_slash + 1) = '\0';
+                snprintf(ctx->config.rustc_ppc, MAX_PATH_LEN, "%srustc_ppc", self_path);
+            } else {
+                strcpy(ctx->config.rustc_ppc, "./rustc_ppc");
+            }
+        }
 
         /* Parse remaining arguments */
         for (int i = 2; i < argc; i++) {
