@@ -469,6 +469,11 @@ RustType parse_type() {
         return TYPE_F32;
     }
     
+    /* Skip r# raw identifier prefix in types */
+    if (*pos == 'r' && *(pos+1) == '#' && (isalpha(*(pos+2)) || *(pos+2) == '_')) {
+        pos += 2;
+    }
+
     /* Check if it's a known struct type or path-qualified type */
     if (isalpha(*pos) || *pos == '_') {
         char type_name[64] = {0};
@@ -511,6 +516,27 @@ RustType parse_type() {
         }
         /* Unknown type — skip any generics */
         if (*pos == '<') skip_generic_params();
+        return TYPE_STRUCT;
+    }
+
+    /* Handle macro metavariables: $ident or $(...) */
+    if (*pos == '$') {
+        pos++;
+        if (*pos == '(') {
+            int d = 1; pos++;
+            while (*pos && d > 0) { if (*pos == '(') d++; else if (*pos == ')') d--; pos++; }
+            /* Skip repeat operators: *, +, ? */
+            while (*pos == '*' || *pos == '+' || *pos == '?') pos++;
+        } else {
+            while (*pos && (isalnum(*pos) || *pos == '_')) pos++;
+        }
+        return TYPE_STRUCT;
+    }
+
+    /* Handle ! (negation in type position) or other single-char noise */
+    if (*pos == '!' || *pos == '~') {
+        pos++;
+        parse_type();
         return TYPE_STRUCT;
     }
 
@@ -2217,6 +2243,30 @@ void compile_rust(char* source) {
             pos += 2;
             while (*pos && !(*pos == '*' && *(pos+1) == '/')) pos++;
             if (*pos) pos += 2;
+            continue;
+        }
+
+        /* Skip string literals — prevents parsing code inside strings as definitions */
+        if (*pos == '"') {
+            pos++;
+            while (*pos && *pos != '"') {
+                if (*pos == '\\') pos++; /* skip escaped char */
+                if (*pos) pos++;
+            }
+            if (*pos == '"') pos++;
+            continue;
+        }
+        /* Skip raw string literals r"..." and r#"..."# */
+        if (*pos == 'r' && (*(pos+1) == '"' || (*(pos+1) == '#' && *(pos+2) == '"'))) {
+            if (*(pos+1) == '#' && *(pos+2) == '"') {
+                pos += 3;
+                while (*pos && !(*pos == '"' && *(pos+1) == '#')) pos++;
+                if (*pos) pos += 2;
+            } else if (*(pos+1) == '"') {
+                pos += 2;
+                while (*pos && *pos != '"') pos++;
+                if (*pos == '"') pos++;
+            }
             continue;
         }
 
