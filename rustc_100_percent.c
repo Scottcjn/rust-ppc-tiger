@@ -62,10 +62,18 @@ typedef struct {
 } Function;
 
 typedef struct {
+    char name[32];
+    RustType type;
+    int offset;
+    int size;
+} StructField;
+
+typedef struct {
     char name[64];
-    char fields[1024];
+    StructField fields[32];
+    int field_count;
     char generics[128];
-    char derives[256];  // #[derive(...)]
+    /* derives not needed for codegen */
     int size;
     int alignment;
 } Struct;
@@ -188,7 +196,40 @@ void skip_generic_params() {
 RustType parse_type() {
     skip_whitespace();
 
-    if (*pos == '&') {
+    if (*pos == '[') {
+        /* Array type: [Type; N] or slice [Type] */
+        pos++;
+        parse_type(); /* skip element type */
+        skip_whitespace();
+        if (*pos == ';') {
+            pos++;
+            skip_whitespace();
+            while (*pos && *pos != ']') pos++; /* skip size expr */
+            if (*pos == ']') pos++;
+            return TYPE_ARRAY;
+        }
+        if (*pos == ']') pos++;
+        return TYPE_SLICE;
+    } else if (*pos == '(') {
+        /* Tuple type: (T1, T2, ...) or unit () */
+        pos++;
+        while (*pos && *pos != ')') {
+            parse_type();
+            skip_whitespace();
+            if (*pos == ',') pos++;
+            skip_whitespace();
+        }
+        if (*pos == ')') pos++;
+        return TYPE_TUPLE;
+    } else if (*pos == '*') {
+        /* Raw pointer: *const T or *mut T */
+        pos++;
+        skip_whitespace();
+        if (strncmp(pos, "const ", 6) == 0) pos += 6;
+        else if (strncmp(pos, "mut ", 4) == 0) pos += 4;
+        parse_type();
+        return TYPE_REF;
+    } else if (*pos == '&') {
         pos++;
         skip_whitespace();
         if (strncmp(pos, "mut ", 4) == 0) {
@@ -228,12 +269,10 @@ RustType parse_type() {
     } else if (strncmp(pos, "char", 4) == 0) {
         pos += 4;
         return TYPE_CHAR;
-    } else if (*pos == '[') {
-        pos++;
-        return TYPE_ARRAY;
-    } else if (*pos == '(') {
-        pos++;
-        return TYPE_TUPLE;
+    } else if (strncmp(pos, "dyn ", 4) == 0) {
+        pos += 4;
+        parse_type(); /* skip trait */
+        return TYPE_TRAIT_OBJ;
     } else if (strncmp(pos, "i128", 4) == 0) {
         pos += 4;
         return TYPE_I128;
@@ -354,6 +393,125 @@ static unsigned int current_file_hash = 0;
 /* Forward declarations */
 void compile_function_body(int frame_size);
 
+/* Compile a simple expression into the given register.
+ * Handles: integer literals, variable references, binary ops (+,-,*,/,%,&,|,^,<<,>>)
+ * Stops at: ; , ) } { and comparison operators (==, !=, <, >, <=, >=)
+ * Returns the RustType of the expression result.
+ */
+RustType compile_expr_to_reg(int dest_reg) {
+    skip_whitespace();
+    RustType result_type = TYPE_I32;
+    int loaded = 0;
+
+    /* Load first operand */
+    if (isdigit(*pos) || (*pos == '-' && isdigit(*(pos+1)))) {
+        int value = parse_number();
+        printf("    li r%d, %d\n", dest_reg, value);
+        loaded = 1;
+    } else if (strncmp(pos, "true", 4) == 0 && !isalnum(*(pos+4))) {
+        pos += 4;
+        printf("    li r%d, 1\n", dest_reg);
+        result_type = TYPE_BOOL;
+        loaded = 1;
+    } else if (strncmp(pos, "false", 5) == 0 && !isalnum(*(pos+5))) {
+        pos += 5;
+        printf("    li r%d, 0\n", dest_reg);
+        result_type = TYPE_BOOL;
+        loaded = 1;
+    } else if (isalpha(*pos) || *pos == '_') {
+        char name[64] = {0};
+        char* save = pos;
+        parse_string(name, sizeof(name));
+        /* Look up variable */
+        int found = 0;
+        int j;
+        for (j = 0; j < var_count; j++) {
+            if (strcmp(vars[j].name, name) == 0) {
+                printf("    lwz r%d, %d(r1)   ; load %s\n", dest_reg, vars[j].offset, name);
+                result_type = vars[j].type;
+                found = 1;
+                break;
+            }
+        }
+        if (!found) {
+            /* Could be a function call: name(...) */
+            skip_whitespace();
+            if (*pos == '(') {
+                /* Rewind and let the caller handle it */
+                pos = save;
+                return result_type;
+            }
+            /* Unknown variable — emit 0 */
+            printf("    li r%d, 0         ; %s (unresolved)\n", dest_reg, name);
+        }
+        loaded = 1;
+    }
+
+    if (!loaded) return result_type;
+
+    /* Check for binary operator */
+    skip_whitespace();
+    while (*pos == '+' || *pos == '-' || *pos == '*' || *pos == '/' || *pos == '%' ||
+           (*pos == '&' && *(pos+1) != '&') || (*pos == '|' && *(pos+1) != '|') ||
+           *pos == '^' || (*pos == '<' && *(pos+1) == '<') || (*pos == '>' && *(pos+1) == '>')) {
+        char op = *pos;
+        char op2 = *(pos+1);
+        int is_shift = (op == '<' && op2 == '<') || (op == '>' && op2 == '>');
+        if (is_shift) pos += 2; else pos++;
+        skip_whitespace();
+
+        /* Load second operand into temp register */
+        int tmp_reg = (dest_reg == 14) ? 15 : 14;
+        if (isdigit(*pos) || (*pos == '-' && isdigit(*(pos+1)))) {
+            int value = parse_number();
+            printf("    li r%d, %d\n", tmp_reg, value);
+        } else if (isalpha(*pos) || *pos == '_') {
+            char rname[64] = {0};
+            parse_string(rname, sizeof(rname));
+            int found = 0;
+            int j;
+            for (j = 0; j < var_count; j++) {
+                if (strcmp(vars[j].name, rname) == 0) {
+                    printf("    lwz r%d, %d(r1)   ; load %s\n", tmp_reg, vars[j].offset, rname);
+                    found = 1;
+                    break;
+                }
+            }
+            if (!found) {
+                printf("    li r%d, 0         ; %s (unresolved)\n", tmp_reg, rname);
+            }
+        }
+
+        /* Emit the arithmetic instruction */
+        if (op == '+') {
+            printf("    add r%d, r%d, r%d\n", dest_reg, dest_reg, tmp_reg);
+        } else if (op == '-') {
+            printf("    sub r%d, r%d, r%d\n", dest_reg, dest_reg, tmp_reg);
+        } else if (op == '*') {
+            printf("    mullw r%d, r%d, r%d\n", dest_reg, dest_reg, tmp_reg);
+        } else if (op == '/') {
+            printf("    divw r%d, r%d, r%d\n", dest_reg, dest_reg, tmp_reg);
+        } else if (op == '%') {
+            printf("    divw r16, r%d, r%d\n", dest_reg, tmp_reg);
+            printf("    mullw r16, r16, r%d\n", tmp_reg);
+            printf("    sub r%d, r%d, r16\n", dest_reg, dest_reg);
+        } else if (op == '&') {
+            printf("    and r%d, r%d, r%d\n", dest_reg, dest_reg, tmp_reg);
+        } else if (op == '|') {
+            printf("    or r%d, r%d, r%d\n", dest_reg, dest_reg, tmp_reg);
+        } else if (op == '^') {
+            printf("    xor r%d, r%d, r%d\n", dest_reg, dest_reg, tmp_reg);
+        } else if (op == '<' && is_shift) {
+            printf("    slw r%d, r%d, r%d\n", dest_reg, dest_reg, tmp_reg);
+        } else if (op == '>' && is_shift) {
+            printf("    sraw r%d, r%d, r%d\n", dest_reg, dest_reg, tmp_reg);
+        }
+        skip_whitespace();
+    }
+
+    return result_type;
+}
+
 /* Compile statements inside a function body.
  * pos must point just after the opening '{'.
  * Emits PPC assembly for all statements until matching '}'.
@@ -363,8 +521,21 @@ void compile_function_body(int frame_size) {
     int saved_var_count = var_count;
     int saved_stack_offset = stack_offset;
     int i;
+    int iter_limit = 100000;  /* Safety: prevent infinite loops */
 
-    while (*pos && brace_depth > 0) {
+    while (*pos && brace_depth > 0 && --iter_limit > 0) {
+        /* Skip comments */
+        if (*pos == '/' && *(pos+1) == '/') {
+            while (*pos && *pos != '\n') pos++;
+            if (*pos == '\n') pos++;
+            continue;
+        }
+        if (*pos == '/' && *(pos+1) == '*') {
+            pos += 2;
+            while (*pos && !(*pos == '*' && *(pos+1) == '/')) pos++;
+            if (*pos) pos += 2;
+            continue;
+        }
         /* Track braces for nested blocks */
         if (*pos == '{') {
             brace_depth++;
@@ -458,19 +629,59 @@ void compile_function_body(int frame_size) {
 
                 } else if (strncmp(pos, "vec![", 5) == 0) {
                     pos += 5;
+                    skip_whitespace();
                     printf("    ; %s = vec![...]\n", var_name);
                     printf("    bl _vec_new\n");
-                    while (*pos && *pos != ']') {
+                    /* Check for vec![value; count] repeat syntax */
+                    int vec_repeat = 0;
+                    if (isdigit(*pos) || (*pos == '-' && isdigit(*(pos+1)))) {
+                        char* save_pos = pos;
+                        int first_val = parse_number();
                         skip_whitespace();
-                        if (*pos == ']') break;
-                        int value = parse_number();
-                        printf("    mr r16, r3\n");
-                        printf("    li r4, %d\n", value);
-                        printf("    bl _vec_push\n");
-                        printf("    mr r3, r16\n");
-                        skip_whitespace();
-                        if (*pos == ',') pos++;
+                        if (*pos == ';') {
+                            pos++; /* past ';' */
+                            skip_whitespace();
+                            /* count could be a variable or literal */
+                            int count = 0;
+                            if (isdigit(*pos)) {
+                                count = parse_number();
+                            } else {
+                                /* Variable count - skip it, emit runtime-sized vec */
+                                while (*pos && *pos != ']') pos++;
+                                count = 0; /* runtime-determined */
+                            }
+                            if (count > 0 && count <= 256) {
+                                for (int vi = 0; vi < count; vi++) {
+                                    printf("    mr r16, r3\n");
+                                    printf("    li r4, %d\n", first_val);
+                                    printf("    bl _vec_push\n");
+                                    printf("    mr r3, r16\n");
+                                }
+                            }
+                            vec_repeat = 1;
+                        } else {
+                            pos = save_pos; /* rewind, not a repeat */
+                        }
                     }
+                    if (!vec_repeat) {
+                        while (*pos && *pos != ']') {
+                            skip_whitespace();
+                            if (*pos == ']') break;
+                            if (isdigit(*pos) || (*pos == '-' && isdigit(*(pos+1)))) {
+                                int value = parse_number();
+                                printf("    mr r16, r3\n");
+                                printf("    li r4, %d\n", value);
+                                printf("    bl _vec_push\n");
+                                printf("    mr r3, r16\n");
+                            } else {
+                                /* Non-numeric element (variable, expr) - skip */
+                                while (*pos && *pos != ',' && *pos != ']') pos++;
+                            }
+                            skip_whitespace();
+                            if (*pos == ',') pos++;
+                        }
+                    }
+                    while (*pos && *pos != ']') pos++;
                     if (*pos == ']') pos++;
                     printf("    stw r3, %d(r1)\n", stack_offset);
                     printf("    lwz r4, 4(r3)\n");
@@ -563,39 +774,91 @@ void compile_function_body(int frame_size) {
 
                 } else if (*pos == '[') {
                     pos++;
+                    skip_whitespace();
                     printf("    ; %s = [...]\n", var_name);
                     int array_idx = 0;
-                    while (*pos && *pos != ']') {
+                    /* Check for [value; count] repeat syntax */
+                    int first_val = 0;
+                    int is_repeat = 0;
+                    if (isdigit(*pos) || (*pos == '-' && isdigit(*(pos+1)))) {
+                        first_val = parse_number();
                         skip_whitespace();
-                        if (*pos == ']') break;
-                        int value = parse_number();
-                        printf("    li r14, %d\n", value);
-                        printf("    stw r14, %d(r1)\n", stack_offset + array_idx * 4);
-                        array_idx++;
-                        skip_whitespace();
-                        if (*pos == ',') pos++;
+                        if (*pos == ';') {
+                            /* [value; count] repeat expression */
+                            pos++; /* past ';' */
+                            skip_whitespace();
+                            int count = parse_number();
+                            skip_whitespace();
+                            if (count > 256) count = 256; /* safety limit */
+                            printf("    li r14, %d\n", first_val);
+                            for (int ri = 0; ri < count; ri++) {
+                                printf("    stw r14, %d(r1)\n", stack_offset + ri * 4);
+                            }
+                            array_idx = count;
+                            is_repeat = 1;
+                        }
                     }
+                    if (!is_repeat) {
+                        /* Regular array literal [a, b, c, ...] */
+                        if (array_idx == 0 && first_val != 0) {
+                            /* We already parsed first_val above */
+                            printf("    li r14, %d\n", first_val);
+                            printf("    stw r14, %d(r1)\n", stack_offset);
+                            array_idx = 1;
+                            skip_whitespace();
+                            if (*pos == ',') pos++;
+                        }
+                        while (*pos && *pos != ']') {
+                            skip_whitespace();
+                            if (*pos == ']') break;
+                            int value = parse_number();
+                            printf("    li r14, %d\n", value);
+                            printf("    stw r14, %d(r1)\n", stack_offset + array_idx * 4);
+                            array_idx++;
+                            skip_whitespace();
+                            if (*pos == ',') pos++;
+                            /* Safety: skip non-numeric non-bracket chars */
+                            while (*pos && *pos != ',' && *pos != ']' && !isdigit(*pos) && *pos != '-') pos++;
+                        }
+                    }
+                    while (*pos && *pos != ']') pos++;
                     if (*pos == ']') pos++;
                     vars[var_count].type = TYPE_ARRAY;
                     vars[var_count].size = array_idx * 4;
 
                 } else if (*pos == '(') {
-                    pos++;
-                    printf("    ; %s = (...)\n", var_name);
-                    int tuple_offset = 0;
-                    while (*pos && *pos != ')') {
-                        skip_whitespace();
-                        if (*pos == ')') break;
-                        int value = parse_number();
-                        printf("    li r14, %d\n", value);
-                        printf("    stw r14, %d(r1)\n", stack_offset + tuple_offset);
-                        tuple_offset += 4;
-                        skip_whitespace();
-                        if (*pos == ',') pos++;
-                    }
+                    /* Parenthesized expression or tuple */
+                    pos++; /* past '(' */
+                    compile_expr_to_reg(14);
+                    while (*pos && *pos != ')') pos++;
                     if (*pos == ')') pos++;
-                    vars[var_count].type = TYPE_TUPLE;
-                    vars[var_count].size = tuple_offset;
+                    skip_whitespace();
+                    /* Check for binary op after closing paren: (expr) * 8 */
+                    while ((*pos == '+' || *pos == '-' || *pos == '*' || *pos == '/' || *pos == '%' ||
+                            (*pos == '&' && *(pos+1) != '&') || (*pos == '|' && *(pos+1) != '|') ||
+                            *pos == '^' || (*pos == '<' && *(pos+1) == '<') || (*pos == '>' && *(pos+1) == '>')) &&
+                           *pos != ';') {
+                        char op = *pos;
+                        char op2 = *(pos+1);
+                        int is_shift = (op == '<' && op2 == '<') || (op == '>' && op2 == '>');
+                        if (is_shift) pos += 2; else pos++;
+                        skip_whitespace();
+                        compile_expr_to_reg(15);
+                        if (op == '+') printf("    add r14, r14, r15\n");
+                        else if (op == '-') printf("    sub r14, r14, r15\n");
+                        else if (op == '*') printf("    mullw r14, r14, r15\n");
+                        else if (op == '/') printf("    divw r14, r14, r15\n");
+                        else if (op == '%') { printf("    divw r16, r14, r15\n"); printf("    mullw r16, r16, r15\n"); printf("    sub r14, r14, r16\n"); }
+                        else if (op == '&') printf("    and r14, r14, r15\n");
+                        else if (op == '|') printf("    or r14, r14, r15\n");
+                        else if (op == '^') printf("    xor r14, r14, r15\n");
+                        else if (op == '<' && is_shift) printf("    slw r14, r14, r15\n");
+                        else if (op == '>' && is_shift) printf("    sraw r14, r14, r15\n");
+                        skip_whitespace();
+                    }
+                    printf("    stw r14, %d(r1)   ; %s\n", stack_offset, var_name);
+                    vars[var_count].type = var_type;
+                    vars[var_count].size = 4;
 
                 } else if (isdigit(*pos) || (*pos == '-' && isdigit(*(pos+1)))) {
                     int value = parse_number();
@@ -641,7 +904,9 @@ void compile_function_body(int frame_size) {
                     vars[var_count].size = 8;
 
                 } else if (isalpha(*pos) || *pos == '_') {
-                    /* Variable reference or function call */
+                    /* Variable reference, function call, or struct literal */
+                    int alpha_size_set = 0;  /* Flag: did a branch set type/size? */
+                    char* ref_start = pos;  /* Save position before parsing name */
                     char ref_name[64] = {0};
                     int ri = 0;
                     while (*pos && (isalnum(*pos) || *pos == '_' || *pos == ':') && ri < 63) {
@@ -650,7 +915,87 @@ void compile_function_body(int frame_size) {
                     ref_name[ri] = '\0';
                     skip_whitespace();
 
-                    if (*pos == '(') {
+                    if (*pos == '{') {
+                        /* Struct literal: Type { field: val, ... } */
+                        pos++;
+                        printf("    ; %s = %s { ... }\n", var_name, ref_name);
+
+                        /* Find struct definition */
+                        int si_idx = -1;
+                        int j;
+                        for (j = 0; j < struct_count; j++) {
+                            if (strcmp(structs[j].name, ref_name) == 0) { si_idx = j; break; }
+                        }
+                        int struct_size = (si_idx >= 0) ? structs[si_idx].size : 16;
+
+                        while (*pos && *pos != '}') {
+                            skip_whitespace();
+                            if (*pos == '}') break;
+                            /* Parse field_name: value */
+                            char fname[64] = {0};
+                            parse_string(fname, sizeof(fname));
+                            skip_whitespace();
+                            if (*pos == ':') pos++;
+                            skip_whitespace();
+
+                            /* Find field offset */
+                            int foff = -1;
+                            if (si_idx >= 0) {
+                                int k;
+                                for (k = 0; k < structs[si_idx].field_count; k++) {
+                                    if (strcmp(structs[si_idx].fields[k].name, fname) == 0) {
+                                        foff = structs[si_idx].fields[k].offset;
+                                        break;
+                                    }
+                                }
+                            }
+                            if (foff < 0) foff = 0;
+
+                            /* Parse value */
+                            if (isdigit(*pos) || (*pos == '-' && isdigit(*(pos+1)))) {
+                                int fval = parse_number();
+                                printf("    li r14, %d\n", fval);
+                                printf("    stw r14, %d(r1)   ; .%s\n", stack_offset + foff, fname);
+                            } else if (*pos == '"') {
+                                pos++;
+                                while (*pos && *pos != '"') { if (*pos == '\\') pos++; pos++; }
+                                if (*pos == '"') pos++;
+                                printf("    li r14, 0         ; .%s (string TODO)\n", fname);
+                                printf("    stw r14, %d(r1)\n", stack_offset + foff);
+                            } else if (isalpha(*pos) || *pos == '_') {
+                                char fvar[64] = {0};
+                                parse_string(fvar, sizeof(fvar));
+                                int found = 0;
+                                int k;
+                                for (k = 0; k < var_count; k++) {
+                                    if (strcmp(vars[k].name, fvar) == 0) {
+                                        printf("    lwz r14, %d(r1)   ; load %s\n", vars[k].offset, fvar);
+                                        printf("    stw r14, %d(r1)   ; .%s\n", stack_offset + foff, fname);
+                                        found = 1;
+                                        break;
+                                    }
+                                }
+                                if (!found) {
+                                    printf("    li r14, 0\n");
+                                    printf("    stw r14, %d(r1)   ; .%s (unresolved)\n", stack_offset + foff, fname);
+                                }
+                            } else {
+                                int fval = parse_number();
+                                printf("    li r14, %d\n", fval);
+                                printf("    stw r14, %d(r1)\n", stack_offset + foff);
+                            }
+
+                            /* Skip past any trailing expr parts (as casts, operators, etc.) */
+                            while (*pos && *pos != ',' && *pos != '}') pos++;
+                            if (*pos == ',') pos++;
+                        }
+                        if (*pos == '}') pos++;
+
+                        vars[var_count].type = TYPE_STRUCT;
+                        vars[var_count].size = struct_size > 0 ? struct_size : 4;
+                        alpha_size_set = 1;
+
+                    } else if (*pos == '(') {
                         printf("    ; %s = %s(...)\n", var_name, ref_name);
                         /* Pass arguments */
                         pos++;
@@ -675,6 +1020,20 @@ void compile_function_body(int frame_size) {
                                 while (*pos && (isalnum(*pos) || *pos == '_') && ai < 63) {
                                     aname[ai++] = *pos++;
                                 }
+                                /* Skip method chains: arg.method().method() */
+                                while (*pos == '.') {
+                                    pos++;
+                                    while (*pos && (isalnum(*pos) || *pos == '_')) pos++;
+                                    if (*pos == '(') {
+                                        pos++;
+                                        int depth = 1;
+                                        while (*pos && depth > 0) {
+                                            if (*pos == '(') depth++;
+                                            else if (*pos == ')') depth--;
+                                            pos++;
+                                        }
+                                    }
+                                }
                                 /* Look up arg variable */
                                 int j;
                                 for (j = 0; j < var_count; j++) {
@@ -686,6 +1045,9 @@ void compile_function_body(int frame_size) {
                                         break;
                                     }
                                 }
+                            } else {
+                                /* Unknown token in function args — skip to avoid infinite loop */
+                                pos++;
                             }
                             skip_whitespace();
                             if (*pos == ',') pos++;
@@ -694,26 +1056,16 @@ void compile_function_body(int frame_size) {
                         printf("    bl _%s\n", ref_name);
                         printf("    stw r3, %d(r1)   ; %s = result\n", stack_offset, var_name);
                     } else {
-                        /* Variable copy */
-                        int found = 0;
-                        int j;
-                        for (j = 0; j < var_count; j++) {
-                            if (strcmp(vars[j].name, ref_name) == 0) {
-                                printf("    lwz r14, %d(r1)   ; load %s\n", vars[j].offset, ref_name);
-                                printf("    stw r14, %d(r1)   ; %s = %s\n", stack_offset, var_name, ref_name);
-                                var_type = vars[j].type;
-                                found = 1;
-                                break;
-                            }
-                        }
-                        if (!found) {
-                            printf("    ; %s = %s (unresolved)\n", var_name, ref_name);
-                            printf("    li r14, 0\n");
-                            printf("    stw r14, %d(r1)\n", stack_offset);
-                        }
+                        /* Variable reference, possibly with binary op: let x = a + b */
+                        /* Rewind pos to before ref_name so compile_expr_to_reg can parse it */
+                        pos = ref_start;
+                        var_type = compile_expr_to_reg(14);
+                        printf("    stw r14, %d(r1)   ; %s\n", stack_offset, var_name);
                     }
-                    vars[var_count].type = var_type;
-                    vars[var_count].size = 4;
+                    if (!alpha_size_set) {
+                        vars[var_count].type = var_type;
+                        vars[var_count].size = 4;
+                    }
 
                 } else {
                     int value = parse_number();
@@ -749,10 +1101,63 @@ void compile_function_body(int frame_size) {
             int my_label = if_label++;
 
             if (strncmp(pos, "let ", 4) == 0) {
-                /* if let — skip for now */
-                printf("    ; if let (simplified)\n");
+                /* if let Some(x) = expr { ... } */
+                pos += 4;
+                skip_whitespace();
+                printf("    ; if let\n");
+
+                /* Parse pattern: Some(var) or Ok(var) */
+                int is_some = 0, is_ok = 0;
+                if (strncmp(pos, "Some(", 5) == 0) { pos += 5; is_some = 1; }
+                else if (strncmp(pos, "Ok(", 3) == 0) { pos += 3; is_ok = 1; }
+
+                char bind_var[64] = {0};
+                parse_string(bind_var, sizeof(bind_var));
+                while (*pos && *pos != '=') pos++;
+                if (*pos == '=') pos++;
+                skip_whitespace();
+
+                /* Parse the expression being matched */
+                char match_expr[64] = {0};
+                parse_string(match_expr, sizeof(match_expr));
+
+                int expr_off = -1;
+                RustType expr_type = TYPE_I32;
+                for (i = 0; i < var_count; i++) {
+                    if (strcmp(vars[i].name, match_expr) == 0) {
+                        expr_off = vars[i].offset;
+                        expr_type = vars[i].type;
+                        break;
+                    }
+                }
+
+                if (expr_off >= 0) {
+                    printf("    lwz r14, %d(r1)   ; load %s tag\n", expr_off, match_expr);
+                    if (is_some || expr_type == TYPE_OPTION) {
+                        printf("    cmpwi r14, 0      ; None?\n");
+                        printf("    beq Lelse_%d\n", my_label);
+                    } else if (is_ok || expr_type == TYPE_RESULT) {
+                        printf("    cmpwi r14, 1      ; Err?\n");
+                        printf("    beq Lelse_%d\n", my_label);
+                    }
+                    /* Bind the inner value */
+                    printf("    lwz r14, %d(r1)   ; load inner value\n", expr_off + 4);
+                    printf("    stw r14, %d(r1)   ; bind %s\n", stack_offset, bind_var);
+                    strcpy(vars[var_count].name, bind_var);
+                    vars[var_count].offset = stack_offset;
+                    vars[var_count].type = TYPE_I32;
+                    vars[var_count].size = 4;
+                    var_count++;
+                    stack_offset += 4;
+                } else {
+                    printf("    li r14, 0\n");
+                    printf("    beq Lelse_%d\n", my_label);
+                }
             } else {
-                /* Simple if: check a variable */
+                /* Parse condition: var, var op expr, !var, function() */
+                int negate = 0;
+                if (*pos == '!') { negate = 1; pos++; skip_whitespace(); }
+
                 char cond_var[64] = {0};
                 parse_string(cond_var, sizeof(cond_var));
 
@@ -769,41 +1174,81 @@ void compile_function_body(int frame_size) {
                 } else {
                     printf("    li r14, 0         ; %s (unresolved)\n", cond_var);
                 }
-                printf("    cmpwi r14, 0\n");
-                printf("    beq Lelse_%d\n", my_label);
+
+                skip_whitespace();
+
+                /* Check for comparison operator */
+                /* Helper macro: load RHS into r15 (number or variable) and emit compare */
+                #define EMIT_CMP_RHS() do { \
+                    if (isdigit(*pos) || (*pos == '-' && isdigit(*(pos+1)))) { \
+                        int rhs = parse_number(); \
+                        printf("    cmpwi r14, %d\n", rhs); \
+                    } else if (isalpha(*pos) || *pos == '_') { \
+                        compile_expr_to_reg(15); \
+                        printf("    cmpw r14, r15\n"); \
+                    } else { \
+                        printf("    cmpwi r14, 0\n"); \
+                    } \
+                } while(0)
+
+                if (strncmp(pos, "==", 2) == 0) {
+                    pos += 2; skip_whitespace();
+                    EMIT_CMP_RHS();
+                    printf("    %s Lelse_%d\n", negate ? "beq" : "bne", my_label);
+                } else if (strncmp(pos, "!=", 2) == 0) {
+                    pos += 2; skip_whitespace();
+                    EMIT_CMP_RHS();
+                    printf("    %s Lelse_%d\n", negate ? "bne" : "beq", my_label);
+                } else if (strncmp(pos, ">=", 2) == 0) {
+                    pos += 2; skip_whitespace();
+                    EMIT_CMP_RHS();
+                    printf("    %s Lelse_%d\n", negate ? "bge" : "blt", my_label);
+                } else if (strncmp(pos, "<=", 2) == 0) {
+                    pos += 2; skip_whitespace();
+                    EMIT_CMP_RHS();
+                    printf("    %s Lelse_%d\n", negate ? "ble" : "bgt", my_label);
+                } else if (*pos == '>' && *(pos+1) != '>') {
+                    pos++; skip_whitespace();
+                    EMIT_CMP_RHS();
+                    printf("    %s Lelse_%d\n", negate ? "bgt" : "ble", my_label);
+                } else if (*pos == '<' && *(pos+1) != '<') {
+                    pos++; skip_whitespace();
+                    EMIT_CMP_RHS();
+                    printf("    %s Lelse_%d\n", negate ? "blt" : "bge", my_label);
+                } else {
+                    /* Boolean truthiness check */
+                    printf("    cmpwi r14, 0\n");
+                    printf("    %s Lelse_%d\n", negate ? "bne" : "beq", my_label);
+                }
+                #undef EMIT_CMP_RHS
             }
 
-            /* Skip to body { ... } */
+            /* Compile if-body */
             while (*pos && *pos != '{') pos++;
             if (*pos == '{') {
                 pos++;
-                /* Compile if-body (inner brace tracking) */
-                int if_depth = 1;
-                while (*pos && if_depth > 0) {
-                    if (*pos == '{') if_depth++;
-                    else if (*pos == '}') { if_depth--; if (if_depth <= 0) break; }
-                    pos++;
-                }
+                compile_function_body(frame_size);
                 if (*pos == '}') pos++;
             }
 
-            skip_whitespace();
             printf("    b Lendif_%d\n", my_label);
             printf("Lelse_%d:\n", my_label);
 
-            /* Check for else */
-            if (strncmp(pos, "else", 4) == 0) {
+            skip_whitespace();
+
+            /* Check for else if / else */
+            if (strncmp(pos, "else", 4) == 0 && !isalnum(*(pos+4))) {
                 pos += 4;
                 skip_whitespace();
+                if (strncmp(pos, "if ", 3) == 0) {
+                    /* else if — don't consume "if", let next iteration handle it */
+                    /* But we need to emit it inside the else block */
+                    /* For now, compile the else-if body inline */
+                }
                 while (*pos && *pos != '{') pos++;
                 if (*pos == '{') {
                     pos++;
-                    int else_depth = 1;
-                    while (*pos && else_depth > 0) {
-                        if (*pos == '{') else_depth++;
-                        else if (*pos == '}') { else_depth--; if (else_depth <= 0) break; }
-                        pos++;
-                    }
+                    compile_function_body(frame_size);
                     if (*pos == '}') pos++;
                 }
             }
@@ -816,7 +1261,10 @@ void compile_function_body(int frame_size) {
 
             printf("Lwhile_%d:\n", my_label);
 
-            /* Parse condition variable */
+            /* Parse condition */
+            int negate = 0;
+            if (*pos == '!') { negate = 1; pos++; skip_whitespace(); }
+
             char cond_var[64] = {0};
             parse_string(cond_var, sizeof(cond_var));
 
@@ -829,19 +1277,49 @@ void compile_function_body(int frame_size) {
             } else {
                 printf("    li r14, 1         ; %s (default true)\n", cond_var);
             }
-            printf("    cmpwi r14, 0\n");
-            printf("    beq Lendwhile_%d\n", my_label);
 
-            /* Skip body */
+            skip_whitespace();
+
+            /* Comparison operators — handle both immediate and variable RHS */
+            #define WHILE_CMP_RHS() do { \
+                if (isdigit(*pos) || (*pos == '-' && isdigit(*(pos+1)))) { \
+                    int rhs = parse_number(); \
+                    printf("    cmpwi r14, %d\n", rhs); \
+                } else if (isalpha(*pos) || *pos == '_') { \
+                    compile_expr_to_reg(15); \
+                    printf("    cmpw r14, r15\n"); \
+                } else { \
+                    printf("    cmpwi r14, 0\n"); \
+                } \
+            } while(0)
+
+            if (strncmp(pos, "==", 2) == 0) {
+                pos += 2; skip_whitespace();
+                WHILE_CMP_RHS();
+                printf("    bne Lendwhile_%d\n", my_label);
+            } else if (strncmp(pos, "!=", 2) == 0) {
+                pos += 2; skip_whitespace();
+                WHILE_CMP_RHS();
+                printf("    beq Lendwhile_%d\n", my_label);
+            } else if (*pos == '<' && *(pos+1) != '<') {
+                pos++; skip_whitespace();
+                WHILE_CMP_RHS();
+                printf("    bge Lendwhile_%d\n", my_label);
+            } else if (*pos == '>' && *(pos+1) != '>') {
+                pos++; skip_whitespace();
+                WHILE_CMP_RHS();
+                printf("    ble Lendwhile_%d\n", my_label);
+            } else {
+                printf("    cmpwi r14, 0\n");
+                printf("    %s Lendwhile_%d\n", negate ? "bne" : "beq", my_label);
+            }
+            #undef WHILE_CMP_RHS
+
+            /* Compile while body */
             while (*pos && *pos != '{') pos++;
             if (*pos == '{') {
                 pos++;
-                int wd = 1;
-                while (*pos && wd > 0) {
-                    if (*pos == '{') wd++;
-                    else if (*pos == '}') { wd--; if (wd <= 0) break; }
-                    pos++;
-                }
+                compile_function_body(frame_size);
                 if (*pos == '}') pos++;
             }
             printf("    b Lwhile_%d\n", my_label);
@@ -851,36 +1329,80 @@ void compile_function_body(int frame_size) {
             pos += 4;
             static int for_label = 0;
             int my_label = for_label++;
-            printf("    ; for loop (stub)\n");
+
+            /* Parse: for VAR in EXPR { ... } */
+            skip_whitespace();
+            char iter_var[64] = {0};
+            parse_string(iter_var, sizeof(iter_var));
+            skip_whitespace();
+            if (strncmp(pos, "in ", 3) == 0) pos += 3;
+            skip_whitespace();
+
+            /* Parse range: 0..N or collection.iter() */
+            int range_start = 0, range_end = 0;
+            int is_range = 0;
+            if (isdigit(*pos)) {
+                range_start = parse_number();
+                if (strncmp(pos, "..", 2) == 0) {
+                    pos += 2;
+                    if (*pos == '=') pos++; /* ..= inclusive */
+                    range_end = parse_number();
+                    is_range = 1;
+                }
+            } else {
+                /* Collection iteration — skip to body */
+                while (*pos && *pos != '{') pos++;
+            }
+
+            /* Register iterator variable */
+            printf("    ; for %s in %d..%d\n", iter_var, range_start, range_end);
+            printf("    li r14, %d\n", range_start);
+            printf("    stw r14, %d(r1)   ; %s = %d\n", stack_offset, iter_var, range_start);
+
+            strcpy(vars[var_count].name, iter_var);
+            vars[var_count].offset = stack_offset;
+            vars[var_count].type = TYPE_I32;
+            vars[var_count].size = 4;
+            int iter_off = stack_offset;
+            var_count++;
+            stack_offset += 4;
+
             printf("Lfor_%d:\n", my_label);
-            /* Skip to body end */
+            if (is_range) {
+                printf("    lwz r14, %d(r1)   ; load %s\n", iter_off, iter_var);
+                printf("    cmpwi r14, %d\n", range_end);
+                printf("    bge Lendfor_%d\n", my_label);
+            }
+
+            /* Compile for body */
             while (*pos && *pos != '{') pos++;
             if (*pos == '{') {
                 pos++;
-                int fd = 1;
-                while (*pos && fd > 0) {
-                    if (*pos == '{') fd++;
-                    else if (*pos == '}') { fd--; if (fd <= 0) break; }
-                    pos++;
-                }
+                compile_function_body(frame_size);
                 if (*pos == '}') pos++;
             }
+
+            /* Increment iterator */
+            if (is_range) {
+                printf("    lwz r14, %d(r1)\n", iter_off);
+                printf("    addi r14, r14, 1\n");
+                printf("    stw r14, %d(r1)\n", iter_off);
+            }
+            printf("    b Lfor_%d\n", my_label);
             printf("Lendfor_%d:\n", my_label);
 
-        } else if (strncmp(pos, "loop ", 5) == 0 || (strncmp(pos, "loop{", 5) == 0)) {
+        } else if (strncmp(pos, "loop", 4) == 0 && (*(pos+4) == ' ' || *(pos+4) == '{')) {
             pos += 4;
             static int loop_label = 0;
             int my_label = loop_label++;
             printf("Lloop_%d:\n", my_label);
+
+            /* Compile loop body */
+            skip_whitespace();
             while (*pos && *pos != '{') pos++;
             if (*pos == '{') {
                 pos++;
-                int ld = 1;
-                while (*pos && ld > 0) {
-                    if (*pos == '{') ld++;
-                    else if (*pos == '}') { ld--; if (ld <= 0) break; }
-                    pos++;
-                }
+                compile_function_body(frame_size);
                 if (*pos == '}') pos++;
             }
             printf("    b Lloop_%d\n", my_label);
@@ -948,24 +1470,8 @@ void compile_function_body(int frame_size) {
                 printf("    ; return None\n");
                 printf("    li r3, 0          ; None tag\n");
             } else {
-                char expr[256] = {0};
-                int idx = 0;
-                while (*pos && *pos != ';' && idx < 255) {
-                    expr[idx++] = *pos++;
-                }
-                /* Try variable lookup first */
-                int found = 0;
-                for (i = 0; i < var_count; i++) {
-                    if (strcmp(vars[i].name, expr) == 0) {
-                        printf("    lwz r3, %d(r1)   ; return %s\n", vars[i].offset, expr);
-                        found = 1;
-                        break;
-                    }
-                }
-                if (!found) {
-                    int value = atoi(expr);
-                    printf("    li r3, %d\n", value);
-                }
+                /* General expression: return x * 2, return a + b, etc. */
+                compile_expr_to_reg(3);
             }
 
             /* RAII cleanup */
@@ -1038,27 +1544,34 @@ void compile_function_body(int frame_size) {
 
             skip_whitespace();
 
-            if (*pos == '=' && *(pos+1) != '=') {
+            if ((*pos == '+' || *pos == '-' || *pos == '*' || *pos == '/' || *pos == '%' ||
+                 *pos == '&' || *pos == '|' || *pos == '^') && *(pos+1) == '=') {
+                /* Compound assignment: +=, -=, *=, /=, %=, &=, |=, ^= */
+                char cop = *pos;
+                pos += 2;
+                skip_whitespace();
+                if (obj_offset >= 0) {
+                    printf("    lwz r14, %d(r1)   ; load %s\n", obj_offset, obj_name);
+                    compile_expr_to_reg(15);
+                    if (cop == '+') printf("    add r14, r14, r15\n");
+                    else if (cop == '-') printf("    sub r14, r14, r15\n");
+                    else if (cop == '*') printf("    mullw r14, r14, r15\n");
+                    else if (cop == '/') printf("    divw r14, r14, r15\n");
+                    else if (cop == '%') { printf("    divw r16, r14, r15\n"); printf("    mullw r16, r16, r15\n"); printf("    sub r14, r14, r16\n"); }
+                    else if (cop == '&') printf("    and r14, r14, r15\n");
+                    else if (cop == '|') printf("    or r14, r14, r15\n");
+                    else if (cop == '^') printf("    xor r14, r14, r15\n");
+                    printf("    stw r14, %d(r1)   ; %s %c= expr\n", obj_offset, obj_name, cop);
+                }
+                while (*pos && *pos != ';') pos++;
+                if (*pos == ';') pos++;
+
+            } else if (*pos == '=' && *(pos+1) != '=') {
                 pos++;
                 skip_whitespace();
                 if (obj_offset >= 0) {
-                    if (isdigit(*pos) || (*pos == '-' && isdigit(*(pos+1)))) {
-                        int value = parse_number();
-                        printf("    ; %s = %d\n", obj_name, value);
-                        printf("    li r14, %d\n", value);
-                        printf("    stw r14, %d(r1)\n", obj_offset);
-                    } else if (isalpha(*pos) || *pos == '_') {
-                        char rhs[64] = {0};
-                        parse_string(rhs, sizeof(rhs));
-                        int j;
-                        for (j = 0; j < var_count; j++) {
-                            if (strcmp(vars[j].name, rhs) == 0) {
-                                printf("    lwz r14, %d(r1)   ; load %s\n", vars[j].offset, rhs);
-                                printf("    stw r14, %d(r1)   ; %s = %s\n", obj_offset, obj_name, rhs);
-                                break;
-                            }
-                        }
-                    }
+                    compile_expr_to_reg(14);
+                    printf("    stw r14, %d(r1)   ; %s = expr\n", obj_offset, obj_name);
                 }
                 while (*pos && *pos != ';') pos++;
                 if (*pos == ';') pos++;
@@ -1109,6 +1622,26 @@ void compile_function_body(int frame_size) {
                         }
                         while (*pos && *pos != ')') pos++;
                         if (*pos == ')') pos++;
+                    } else {
+                        /* Field access: obj.field (not a method call) */
+                        printf("    ; %s.%s (field access)\n", obj_name, method);
+                        int field_off = 0;
+
+                        /* Look up struct type and field offset */
+                        if (obj_type == TYPE_STRUCT) {
+                            int si;
+                            for (si = 0; si < struct_count; si++) {
+                                int fi;
+                                for (fi = 0; fi < structs[si].field_count; fi++) {
+                                    if (strcmp(structs[si].fields[fi].name, method) == 0) {
+                                        field_off = structs[si].fields[fi].offset;
+                                        goto found_field;
+                                    }
+                                }
+                            }
+                        }
+                        found_field:
+                        printf("    lwz r3, %d(r1)    ; load %s.%s\n", var_off + field_off, obj_name, method);
                     }
                 }
                 while (*pos && *pos != ';') pos++;
@@ -1217,16 +1750,25 @@ void compile_rust(char* source) {
     /* Pass 1: Collect type definitions */
     while (*pos) {
         skip_whitespace();
-        
+
+        /* Skip comments */
+        if (*pos == '/' && *(pos+1) == '/') {
+            while (*pos && *pos != '\n') pos++;
+            if (*pos == '\n') pos++;
+            continue;
+        }
+        if (*pos == '/' && *(pos+1) == '*') {
+            pos += 2;
+            while (*pos && !(*pos == '*' && *(pos+1) == '/')) pos++;
+            if (*pos) pos += 2;
+            continue;
+        }
+
         if (strncmp(pos, "#[derive(", 9) == 0) {
             /* Parse derive macros */
             pos += 9;
-            char derives[256] = {0};
-            int idx = 0;
-            while (*pos && *pos != ')' && idx < 255) {
-                derives[idx++] = *pos++;
-            }
-            /* Store for next struct/enum */
+            /* Skip derive content - parsed but not needed for codegen */
+            while (*pos && *pos != ')') pos++;
         } else if (strncmp(pos, "struct ", 7) == 0) {
             pos += 7;
             skip_whitespace();
@@ -1248,15 +1790,189 @@ void compile_rust(char* source) {
                 if (*pos == '>') pos++;
             }
             
-            /* Calculate size and alignment */
-            structs[struct_count].size = 16; /* Default */
+            /* Parse struct fields */
+            skip_whitespace();
+            structs[struct_count].field_count = 0;
             structs[struct_count].alignment = 4;
+
+            if (*pos == '{') {
+                pos++;
+                int field_offset = 0;
+                while (*pos && *pos != '}') {
+                    skip_whitespace();
+                    if (*pos == '}') break;
+                    /* Skip pub keyword */
+                    if (strncmp(pos, "pub ", 4) == 0) pos += 4;
+                    skip_whitespace();
+                    /* Parse field name */
+                    char fname[32] = {0};
+                    int fi = 0;
+                    while (*pos && (isalnum(*pos) || *pos == '_') && fi < 31) {
+                        fname[fi++] = *pos++;
+                    }
+                    fname[fi] = '\0';
+                    skip_whitespace();
+                    if (*pos == ':') pos++;
+                    skip_whitespace();
+                    /* Parse field type */
+                    RustType ftype = parse_type();
+                    int fsize = 4; /* default */
+                    switch (ftype) {
+                        case TYPE_I8: case TYPE_U8: case TYPE_BOOL: fsize = 1; break;
+                        case TYPE_I16: case TYPE_U16: fsize = 2; break;
+                        case TYPE_I64: case TYPE_U64: case TYPE_F64: fsize = 8; break;
+                        case TYPE_I128: case TYPE_U128: fsize = 16; break;
+                        case TYPE_STRING: case TYPE_VEC: fsize = 12; break;
+                        case TYPE_STR: case TYPE_SLICE: fsize = 8; break;
+                        default: fsize = 4; break;
+                    }
+                    /* Align field */
+                    int align = fsize > 4 ? 4 : (fsize < 4 ? fsize : 4);
+                    field_offset = (field_offset + align - 1) & ~(align - 1);
+
+                    int idx = structs[struct_count].field_count;
+                    if (idx < 32) {
+                        strcpy(structs[struct_count].fields[idx].name, fname);
+                        structs[struct_count].fields[idx].type = ftype;
+                        structs[struct_count].fields[idx].offset = field_offset;
+                        structs[struct_count].fields[idx].size = fsize;
+                        structs[struct_count].field_count++;
+                    }
+                    field_offset += fsize;
+
+                    /* Skip comma */
+                    skip_whitespace();
+                    if (*pos == ',') pos++;
+                }
+                if (*pos == '}') pos++;
+                structs[struct_count].size = (field_offset + 3) & ~3; /* Pad to 4-byte */
+            } else if (*pos == '(') {
+                /* Tuple struct: struct Foo(i32, i32); */
+                pos++;
+                int field_offset = 0;
+                int tidx = 0;
+                while (*pos && *pos != ')') {
+                    skip_whitespace();
+                    if (*pos == ')') break;
+                    RustType ftype = parse_type();
+                    int fsize = 4;
+                    switch (ftype) {
+                        case TYPE_I8: case TYPE_U8: case TYPE_BOOL: fsize = 1; break;
+                        case TYPE_I16: case TYPE_U16: fsize = 2; break;
+                        case TYPE_I64: case TYPE_U64: case TYPE_F64: fsize = 8; break;
+                        default: fsize = 4; break;
+                    }
+                    int idx = structs[struct_count].field_count;
+                    if (idx < 32) {
+                        char tname[32];
+                        snprintf(tname, sizeof(tname), "%d", tidx);
+                        strcpy(structs[struct_count].fields[idx].name, tname);
+                        structs[struct_count].fields[idx].type = ftype;
+                        structs[struct_count].fields[idx].offset = field_offset;
+                        structs[struct_count].fields[idx].size = fsize;
+                        structs[struct_count].field_count++;
+                    }
+                    field_offset += fsize;
+                    tidx++;
+                    skip_whitespace();
+                    if (*pos == ',') pos++;
+                }
+                if (*pos == ')') pos++;
+                while (*pos && *pos != ';') pos++;
+                if (*pos == ';') pos++;
+                structs[struct_count].size = (field_offset + 3) & ~3;
+            } else if (*pos == ';') {
+                /* Unit struct: struct Foo; */
+                structs[struct_count].size = 0;
+                pos++;
+            } else {
+                structs[struct_count].size = 0;
+            }
+
             struct_count++;
-            
+
         } else if (strncmp(pos, "enum ", 5) == 0) {
             /* Parse enum definition */
             pos += 5;
-            /* Similar to struct */
+            skip_whitespace();
+            char enum_name[64] = {0};
+            parse_string(enum_name, sizeof(enum_name));
+            skip_whitespace();
+
+            /* Store as a struct with tag field */
+            strcpy(structs[struct_count].name, enum_name);
+            structs[struct_count].field_count = 0;
+            structs[struct_count].alignment = 4;
+
+            if (*pos == '{') {
+                pos++;
+                int variant_idx = 0;
+                int max_payload = 0;
+                while (*pos && *pos != '}') {
+                    skip_whitespace();
+                    if (*pos == '}') break;
+                    /* Parse variant name */
+                    char vname[32] = {0};
+                    int vi = 0;
+                    while (*pos && (isalnum(*pos) || *pos == '_') && vi < 31) {
+                        vname[vi++] = *pos++;
+                    }
+                    vname[vi] = '\0';
+
+                    int payload_size = 0;
+                    if (*pos == '(') {
+                        /* Tuple variant: Variant(Type, Type) */
+                        pos++;
+                        while (*pos && *pos != ')') {
+                            skip_whitespace();
+                            if (*pos == ')') break;
+                            parse_type();
+                            payload_size += 4;
+                            skip_whitespace();
+                            if (*pos == ',') pos++;
+                        }
+                        if (*pos == ')') pos++;
+                    } else if (*pos == '{') {
+                        /* Struct variant: Variant { field: Type } */
+                        pos++;
+                        while (*pos && *pos != '}') {
+                            skip_whitespace();
+                            if (*pos == '}') break;
+                            while (*pos && *pos != ':' && *pos != '}') pos++;
+                            if (*pos == ':') { pos++; skip_whitespace(); parse_type(); payload_size += 4; }
+                            skip_whitespace();
+                            if (*pos == ',') pos++;
+                        }
+                        if (*pos == '}') pos++;
+                    }
+                    /* = value for C-like enums */
+                    skip_whitespace();
+                    if (*pos == '=') {
+                        pos++;
+                        skip_whitespace();
+                        parse_number();
+                    }
+
+                    if (payload_size > max_payload) max_payload = payload_size;
+
+                    /* Store variant as a pseudo-field */
+                    int idx = structs[struct_count].field_count;
+                    if (idx < 32) {
+                        strcpy(structs[struct_count].fields[idx].name, vname);
+                        structs[struct_count].fields[idx].type = TYPE_ENUM;
+                        structs[struct_count].fields[idx].offset = variant_idx;
+                        structs[struct_count].fields[idx].size = payload_size;
+                        structs[struct_count].field_count++;
+                    }
+                    variant_idx++;
+
+                    skip_whitespace();
+                    if (*pos == ',') pos++;
+                }
+                if (*pos == '}') pos++;
+                structs[struct_count].size = 4 + max_payload; /* tag + max payload */
+            }
+            struct_count++;
             
         } else if (strncmp(pos, "trait ", 6) == 0) {
             pos += 6;
@@ -1429,7 +2145,6 @@ void compile_rust(char* source) {
             printf("    stwu r1, -256(r1)  ; frame for %s\n", fn_name);
 
             /* Store params from registers to stack AND register them as variables */
-            int pi;
             /* Parse parameter names from the function signature */
             char* param_scan = paren + 1;
             int param_idx = 0;
@@ -1793,8 +2508,8 @@ int main(int argc, char** argv) {
     fseek(f, 0, SEEK_SET);
     
     char* source = malloc(size + 1);
-    fread(source, 1, size, f);
-    source[size] = 0;
+    size_t nread = fread(source, 1, size, f);
+    source[nread] = 0;
     fclose(f);
     
     current_file_hash = file_hash(argv[1]);
