@@ -903,6 +903,121 @@ void compile_function_body(int frame_size) {
                     vars[var_count].type = TYPE_STR;
                     vars[var_count].size = 8;
 
+                } else if (strncmp(pos, "match ", 6) == 0) {
+                    /* Match expression: let x = match val { arms }; */
+                    pos += 6;
+                    skip_whitespace();
+                    printf("    ; %s = match ...\n", var_name);
+
+                    /* Load the match subject into r14 */
+                    compile_expr_to_reg(14);
+                    skip_whitespace();
+                    /* Skip to opening { */
+                    while (*pos && *pos != '{') pos++;
+                    if (*pos == '{') pos++;
+
+                    static int match_label_let = 0;
+                    int arm_count = 0;
+                    int end_label = match_label_let++;
+
+                    /* Parse match arms: pattern => expr, */
+                    while (*pos) {
+                        skip_whitespace();
+                        if (*pos == '}') { pos++; break; }
+                        /* Skip comments */
+                        if (*pos == '/' && *(pos+1) == '/') {
+                            while (*pos && *pos != '\n') pos++;
+                            if (*pos == '\n') pos++;
+                            continue;
+                        }
+                        if (*pos == '/' && *(pos+1) == '*') {
+                            pos += 2;
+                            while (*pos && !(*pos == '*' && *(pos+1) == '/')) pos++;
+                            if (*pos) pos += 2;
+                            continue;
+                        }
+
+                        int is_wildcard = (*pos == '_' && (*(pos+1) == ' ' || *(pos+1) == '='));
+                        static int arm_label_ctr = 0;
+                        int arm_label = arm_label_ctr++;
+
+                        if (is_wildcard) {
+                            /* _ => default arm */
+                            pos++; /* skip _ */
+                            skip_whitespace();
+                            if (*pos == '=' && *(pos+1) == '>') pos += 2;
+                            skip_whitespace();
+                            compile_expr_to_reg(15);
+                            printf("    mr r14, r15\n");
+                            /* Skip to comma or closing brace */
+                            while (*pos && *pos != ',' && *pos != '}') {
+                                if (*pos == '{') {
+                                    int d = 1; pos++;
+                                    while (*pos && d > 0) {
+                                        if (*pos == '{') d++;
+                                        else if (*pos == '}') d--;
+                                        pos++;
+                                    }
+                                } else pos++;
+                            }
+                            if (*pos == ',') pos++;
+                            printf("    b Lmatch_end_%d\n", end_label);
+                        } else if (isdigit(*pos) || (*pos == '-' && isdigit(*(pos+1)))) {
+                            /* Numeric pattern: N => expr */
+                            int pat_val = parse_number();
+                            skip_whitespace();
+                            /* Skip | alternatives: 1 | 2 | 3 => */
+                            while (*pos == '|') {
+                                pos++;
+                                skip_whitespace();
+                                parse_number();
+                                skip_whitespace();
+                            }
+                            if (*pos == '=' && *(pos+1) == '>') pos += 2;
+                            skip_whitespace();
+                            printf("    cmpwi r14, %d\n", pat_val);
+                            printf("    bne Lmatch_skip_%d\n", arm_label);
+                            compile_expr_to_reg(15);
+                            printf("    mr r14, r15\n");
+                            /* Skip to comma or closing brace */
+                            while (*pos && *pos != ',' && *pos != '}') {
+                                if (*pos == '{') {
+                                    int d = 1; pos++;
+                                    while (*pos && d > 0) {
+                                        if (*pos == '{') d++;
+                                        else if (*pos == '}') d--;
+                                        pos++;
+                                    }
+                                } else pos++;
+                            }
+                            if (*pos == ',') pos++;
+                            printf("    b Lmatch_end_%d\n", end_label);
+                            printf("Lmatch_skip_%d:\n", arm_label);
+                        } else {
+                            /* Named/complex pattern — skip the arm */
+                            while (*pos && *pos != '=' ) pos++;
+                            if (*pos == '=' && *(pos+1) == '>') pos += 2;
+                            skip_whitespace();
+                            /* Skip arm body */
+                            while (*pos && *pos != ',' && *pos != '}') {
+                                if (*pos == '{') {
+                                    int d = 1; pos++;
+                                    while (*pos && d > 0) {
+                                        if (*pos == '{') d++;
+                                        else if (*pos == '}') d--;
+                                        pos++;
+                                    }
+                                } else pos++;
+                            }
+                            if (*pos == ',') pos++;
+                        }
+                        arm_count++;
+                    }
+                    printf("Lmatch_end_%d:\n", end_label);
+                    printf("    stw r14, %d(r1)   ; %s = match result\n", stack_offset, var_name);
+                    vars[var_count].type = var_type;
+                    vars[var_count].size = 4;
+
                 } else if (isalpha(*pos) || *pos == '_') {
                     /* Variable reference, function call, or struct literal */
                     int alpha_size_set = 0;  /* Flag: did a branch set type/size? */
@@ -1411,39 +1526,93 @@ void compile_function_body(int frame_size) {
         } else if (strncmp(pos, "match ", 6) == 0) {
             pos += 6;
             skip_whitespace();
-            char match_var[64] = {0};
-            parse_string(match_var, sizeof(match_var));
-            printf("    ; match %s\n", match_var);
+            printf("    ; match statement\n");
 
-            Variable* var = NULL;
-            for (i = 0; i < var_count; i++) {
-                if (strcmp(vars[i].name, match_var) == 0) { var = &vars[i]; break; }
-            }
+            /* Load match subject into r14 */
+            compile_expr_to_reg(14);
+            skip_whitespace();
 
-            if (var && var->type == TYPE_OPTION) {
-                printf("    lwz r14, %d(r1)   ; load tag\n", var->offset);
-                printf("    cmpwi r14, 0\n");
-                printf("    beq Lmatch_none_%d\n", var_count);
-                printf("    b Lmatch_some_%d\n", var_count);
-            } else if (var && var->type == TYPE_RESULT) {
-                printf("    lwz r14, %d(r1)   ; load tag\n", var->offset);
-                printf("    cmpwi r14, 0\n");
-                printf("    beq Lmatch_ok_%d\n", var_count);
-                printf("    b Lmatch_err_%d\n", var_count);
-            }
-
-            /* Skip match body */
+            /* Skip to opening { */
             while (*pos && *pos != '{') pos++;
-            if (*pos == '{') {
-                pos++;
-                int md = 1;
-                while (*pos && md > 0) {
-                    if (*pos == '{') md++;
-                    else if (*pos == '}') { md--; if (md <= 0) break; }
-                    pos++;
+            if (*pos == '{') pos++;
+
+            static int match_label_stmt = 0;
+            int end_label = match_label_stmt++;
+
+            /* Parse match arms */
+            while (*pos) {
+                skip_whitespace();
+                if (*pos == '}') { pos++; break; }
+                /* Skip comments */
+                if (*pos == '/' && *(pos+1) == '/') {
+                    while (*pos && *pos != '\n') pos++;
+                    if (*pos == '\n') pos++;
+                    continue;
                 }
-                if (*pos == '}') pos++;
+                if (*pos == '/' && *(pos+1) == '*') {
+                    pos += 2;
+                    while (*pos && !(*pos == '*' && *(pos+1) == '/')) pos++;
+                    if (*pos) pos += 2;
+                    continue;
+                }
+
+                int is_wildcard = (*pos == '_' && (*(pos+1) == ' ' || *(pos+1) == '='));
+                static int arm_label_stmt = 0;
+                int arm_label = arm_label_stmt++;
+
+                if (is_wildcard) {
+                    pos++;
+                    skip_whitespace();
+                    if (*pos == '=' && *(pos+1) == '>') pos += 2;
+                    skip_whitespace();
+                    /* Compile arm body */
+                    if (*pos == '{') {
+                        pos++;
+                        compile_function_body(frame_size);
+                        if (*pos == '}') pos++;
+                    } else {
+                        /* Single expression arm — skip it */
+                        while (*pos && *pos != ',' && *pos != '}') pos++;
+                    }
+                    if (*pos == ',') pos++;
+                    printf("    b Lmatch_end_%d\n", end_label);
+                } else if (isdigit(*pos) || (*pos == '-' && isdigit(*(pos+1)))) {
+                    int pat_val = parse_number();
+                    skip_whitespace();
+                    while (*pos == '|') { pos++; skip_whitespace(); parse_number(); skip_whitespace(); }
+                    if (*pos == '=' && *(pos+1) == '>') pos += 2;
+                    skip_whitespace();
+                    printf("    cmpwi r14, %d\n", pat_val);
+                    printf("    bne Lmatch_skip_%d\n", arm_label);
+                    if (*pos == '{') {
+                        pos++;
+                        compile_function_body(frame_size);
+                        if (*pos == '}') pos++;
+                    } else {
+                        while (*pos && *pos != ',' && *pos != '}') pos++;
+                    }
+                    if (*pos == ',') pos++;
+                    printf("    b Lmatch_end_%d\n", end_label);
+                    printf("Lmatch_skip_%d:\n", arm_label);
+                } else {
+                    /* Named/complex pattern — skip entire arm */
+                    while (*pos && *pos != '=') pos++;
+                    if (*pos == '=' && *(pos+1) == '>') pos += 2;
+                    skip_whitespace();
+                    if (*pos == '{') {
+                        int d = 1; pos++;
+                        while (*pos && d > 0) {
+                            if (*pos == '{') d++;
+                            else if (*pos == '}') d--;
+                            pos++;
+                        }
+                    } else {
+                        while (*pos && *pos != ',' && *pos != '}') pos++;
+                    }
+                    if (*pos == ',') pos++;
+                }
             }
+            printf("Lmatch_end_%d:\n", end_label);
 
         } else if (strncmp(pos, "return ", 7) == 0) {
             pos += 7;
