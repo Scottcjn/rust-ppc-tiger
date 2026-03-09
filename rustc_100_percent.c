@@ -113,6 +113,7 @@ int struct_count = 0;
 int trait_count = 0;
 int impl_count = 0;
 int macro_count = 0;
+int current_impl_struct = -1;  /* Index into structs[] for self.field resolution */
 int stack_offset = 72;  /* Past PPC linkage area (24) + param save area (8*4=32) + padding (16) */
 int heap_offset = 0;
 int async_context_size = 0;
@@ -430,6 +431,60 @@ RustType compile_expr_to_reg(int dest_reg) {
                 printf("    lwz r%d, %d(r1)   ; load %s\n", dest_reg, vars[j].offset, name);
                 result_type = vars[j].type;
                 found = 1;
+                /* Check for .field access */
+                if (*pos == '.') {
+                    char field_name[64] = {0};
+                    pos++; /* skip '.' */
+                    int fi = 0;
+                    while (*pos && (isalnum(*pos) || *pos == '_') && fi < 63) {
+                        field_name[fi++] = *pos++;
+                    }
+                    field_name[fi] = '\0';
+                    /* Skip method calls: .method() — let caller handle */
+                    if (*pos == '(') {
+                        /* rewind */
+                        pos -= fi + 1;
+                    } else {
+                        /* Resolve struct field */
+                        int struct_idx = -1;
+                        /* If this is 'self', use current_impl_struct */
+                        if (strcmp(name, "self") == 0 && current_impl_struct >= 0) {
+                            struct_idx = current_impl_struct;
+                        } else {
+                            /* Look up variable's struct type */
+                            for (int si = 0; si < struct_count; si++) {
+                                if (vars[j].type == TYPE_STRUCT) {
+                                    struct_idx = si; /* TODO: track actual struct type per var */
+                                    break;
+                                }
+                            }
+                        }
+                        if (struct_idx >= 0) {
+                            Struct* s = &structs[struct_idx];
+                            int fk;
+                            for (fk = 0; fk < s->field_count; fk++) {
+                                if (strcmp(s->fields[fk].name, field_name) == 0) {
+                                    if (strcmp(name, "self") == 0) {
+                                        /* self is a pointer — dereference then offset */
+                                        printf("    lwz r%d, %d(r%d)  ; self.%s\n",
+                                               dest_reg, s->fields[fk].offset, dest_reg, field_name);
+                                    } else {
+                                        /* struct is inline on stack */
+                                        printf("    lwz r%d, %d(r1)   ; %s.%s\n",
+                                               dest_reg, vars[j].offset + s->fields[fk].offset, name, field_name);
+                                    }
+                                    result_type = s->fields[fk].type;
+                                    break;
+                                }
+                            }
+                            if (fk == s->field_count) {
+                                printf("    ; unresolved field %s.%s\n", name, field_name);
+                            }
+                        } else {
+                            printf("    ; unresolved struct for %s.%s\n", name, field_name);
+                        }
+                    }
+                }
                 break;
             }
         }
@@ -437,7 +492,6 @@ RustType compile_expr_to_reg(int dest_reg) {
             /* Could be a function call: name(...) */
             skip_whitespace();
             if (*pos == '(') {
-                /* Rewind and let the caller handle it */
                 pos = save;
                 return result_type;
             }
@@ -1794,23 +1848,77 @@ void compile_function_body(int frame_size) {
                     } else {
                         /* Field access: obj.field (not a method call) */
                         printf("    ; %s.%s (field access)\n", obj_name, method);
-                        int field_off = 0;
+                        int field_off = -1;
+                        int is_self = (strcmp(obj_name, "self") == 0);
 
-                        /* Look up struct type and field offset */
-                        if (obj_type == TYPE_STRUCT) {
-                            int si;
-                            for (si = 0; si < struct_count; si++) {
+                        /* Resolve struct type */
+                        int struct_idx = -1;
+                        if (is_self && current_impl_struct >= 0) {
+                            struct_idx = current_impl_struct;
+                        } else if (obj_type == TYPE_STRUCT) {
+                            for (int si = 0; si < struct_count; si++) {
                                 int fi;
                                 for (fi = 0; fi < structs[si].field_count; fi++) {
                                     if (strcmp(structs[si].fields[fi].name, method) == 0) {
+                                        struct_idx = si;
                                         field_off = structs[si].fields[fi].offset;
-                                        goto found_field;
+                                        break;
                                     }
+                                }
+                                if (field_off >= 0) break;
+                            }
+                        }
+                        if (struct_idx >= 0 && field_off < 0) {
+                            for (int fi = 0; fi < structs[struct_idx].field_count; fi++) {
+                                if (strcmp(structs[struct_idx].fields[fi].name, method) == 0) {
+                                    field_off = structs[struct_idx].fields[fi].offset;
+                                    break;
                                 }
                             }
                         }
-                        found_field:
-                        printf("    lwz r3, %d(r1)    ; load %s.%s\n", var_off + field_off, obj_name, method);
+                        if (field_off < 0) field_off = 0;
+
+                        skip_whitespace();
+                        if (*pos == '=' && *(pos+1) != '=') {
+                            /* self.field = expr */
+                            pos++;
+                            skip_whitespace();
+                            compile_expr_to_reg(14);
+                            if (is_self) {
+                                printf("    lwz r15, %d(r1)   ; load self ptr\n", var_off);
+                                printf("    stw r14, %d(r15)  ; self.%s = expr\n", field_off, method);
+                            } else {
+                                printf("    stw r14, %d(r1)   ; %s.%s = expr\n", var_off + field_off, obj_name, method);
+                            }
+                        } else if ((*pos == '+' || *pos == '-' || *pos == '*') && *(pos+1) == '=') {
+                            /* self.field += expr */
+                            char cop = *pos;
+                            pos += 2;
+                            skip_whitespace();
+                            if (is_self) {
+                                printf("    lwz r15, %d(r1)   ; load self ptr\n", var_off);
+                                printf("    lwz r14, %d(r15)  ; load self.%s\n", field_off, method);
+                            } else {
+                                printf("    lwz r14, %d(r1)   ; load %s.%s\n", var_off + field_off, obj_name, method);
+                            }
+                            compile_expr_to_reg(16);
+                            if (cop == '+') printf("    add r14, r14, r16\n");
+                            else if (cop == '-') printf("    sub r14, r14, r16\n");
+                            else if (cop == '*') printf("    mullw r14, r14, r16\n");
+                            if (is_self) {
+                                printf("    stw r14, %d(r15)  ; self.%s %c= expr\n", field_off, method, cop);
+                            } else {
+                                printf("    stw r14, %d(r1)   ; %s.%s %c= expr\n", var_off + field_off, obj_name, method, cop);
+                            }
+                        } else {
+                            /* Just a read: obj.field */
+                            if (is_self) {
+                                printf("    lwz r15, %d(r1)   ; load self ptr\n", var_off);
+                                printf("    lwz r3, %d(r15)   ; load self.%s\n", field_off, method);
+                            } else {
+                                printf("    lwz r3, %d(r1)    ; load %s.%s\n", var_off + field_off, obj_name, method);
+                            }
+                        }
                     }
                 }
                 while (*pos && *pos != ';') pos++;
@@ -2318,16 +2426,18 @@ void compile_rust(char* source) {
     {
         char* scan = source;
         while ((scan = strstr(scan, "fn ")) != NULL) {
-            /* Skip if inside a comment or string */
-            /* Check it's a top-level fn (not "fn main") */
             char* fn_start = scan;
             scan += 3;
+
+            /* Skip if preceded by non-boundary char (e.g. "cfn") */
+            if (fn_start > source && (isalnum(*(fn_start-1)) || *(fn_start-1) == '_')) continue;
+
+            char* save_pos = pos;
+            pos = scan;
             skip_whitespace();
 
             char fn_name[64] = {0};
             int ni = 0;
-            char* save_pos = pos;
-            pos = scan;
             while (*pos && (isalnum(*pos) || *pos == '_') && ni < 63) {
                 fn_name[ni++] = *pos++;
             }
@@ -2337,57 +2447,150 @@ void compile_rust(char* source) {
 
             /* Skip main — handled separately below */
             if (strcmp(fn_name, "main") == 0) continue;
-            /* Skip trait/impl method declarations (no body) */
             if (fn_name[0] == '\0') continue;
 
             /* Find the function body */
             char* body = strchr(scan, '{');
             if (!body) continue;
 
+            /* Check for semicolon before brace — trait method declaration (no body) */
+            {
+                char* check = scan;
+                while (check < body) {
+                    if (*check == ';') break;
+                    check++;
+                }
+                if (check < body && *check == ';') { scan = check + 1; continue; }
+            }
+
+            /* Determine impl type by scanning backward for "impl Type" */
+            char impl_type[64] = {0};
+            int impl_struct_idx = -1;
+            {
+                /* Count brace depth from source to fn_start */
+                char* bp = source;
+                char* last_impl = NULL;
+                int depth = 0;
+                while (bp < fn_start) {
+                    if (*bp == '{') depth++;
+                    else if (*bp == '}') { depth--; last_impl = NULL; }
+                    else if (depth == 0 && strncmp(bp, "impl ", 5) == 0) {
+                        last_impl = bp;
+                    } else if (depth == 0 && strncmp(bp, "impl<", 5) == 0) {
+                        last_impl = bp;
+                    }
+                    bp++;
+                }
+                /* If we're inside an impl block (depth > 0 when we hit the fn) */
+                /* Re-scan: find the impl that owns this fn */
+                bp = source;
+                depth = 0;
+                last_impl = NULL;
+                while (bp < fn_start) {
+                    if (*bp == '/' && *(bp+1) == '/') { while (*bp && *bp != '\n') bp++; continue; }
+                    if (*bp == '/' && *(bp+1) == '*') { bp += 2; while (*bp && !(*bp == '*' && *(bp+1) == '/')) bp++; if (*bp) bp += 2; continue; }
+                    if (strncmp(bp, "impl ", 5) == 0 || strncmp(bp, "impl<", 5) == 0) {
+                        last_impl = bp;
+                    }
+                    if (*bp == '{') {
+                        depth++;
+                    } else if (*bp == '}') {
+                        depth--;
+                        if (depth == 0) last_impl = NULL;
+                    }
+                    bp++;
+                }
+                if (last_impl && depth > 0) {
+                    /* Extract type name from "impl [<...>] TypeName" */
+                    char* tp = last_impl + 4;
+                    while (*tp && isspace(*tp)) tp++;
+                    if (*tp == '<') { int d = 1; tp++; while (*tp && d > 0) { if (*tp == '<') d++; else if (*tp == '>') d--; tp++; } }
+                    while (*tp && isspace(*tp)) tp++;
+                    int ti = 0;
+                    while (*tp && (isalnum(*tp) || *tp == '_') && ti < 63) {
+                        impl_type[ti++] = *tp++;
+                    }
+                    impl_type[ti] = '\0';
+                    /* Find struct index for field offsets */
+                    for (int si = 0; si < struct_count; si++) {
+                        if (strcmp(structs[si].name, impl_type) == 0) {
+                            impl_struct_idx = si;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            /* Build full function name: Type_method or just method */
+            char full_name[128] = {0};
+            if (impl_type[0]) {
+                snprintf(full_name, sizeof(full_name), "%s_%s", impl_type, fn_name);
+            } else {
+                snprintf(full_name, sizeof(full_name), "%s", fn_name);
+            }
+
             /* Parse parameter list */
             char* paren = strchr(fn_start + 3, '(');
-            /* Count params for frame sizing */
             int param_count = 0;
+            int has_self = 0;
             if (paren && paren < body) {
                 char* pp = paren + 1;
+                while (*pp && isspace(*pp)) pp++;
+                /* Check for self parameter */
+                if (strncmp(pp, "&mut self", 9) == 0 || strncmp(pp, "&self", 5) == 0 ||
+                    strncmp(pp, "mut self", 8) == 0 || strncmp(pp, "self", 4) == 0) {
+                    has_self = 1;
+                }
+                pp = paren + 1;
                 while (*pp && *pp != ')') {
                     if (*pp == ':') param_count++;
                     pp++;
                 }
+                if (has_self) param_count++; /* self doesn't have : but is a param */
             }
 
             printf("\n.align 2\n");
-            printf("_%s:\n", fn_name);
+            printf("_%s:\n", full_name);
             printf("    mflr r0\n");
             printf("    stw r0, 8(r1)\n");
-            printf("    stwu r1, -256(r1)  ; frame for %s\n", fn_name);
+            printf("    stwu r1, -256(r1)  ; frame for %s\n", full_name);
 
-            /* Store params from registers to stack AND register them as variables */
-            /* Parse parameter names from the function signature */
-            char* param_scan = paren + 1;
-            int param_idx = 0;
-            save_pos = pos;  /* Reuse existing save_pos from outer scope */
+            /* Register variables */
             int save_var_count = var_count;
             int save_stack_offset = stack_offset;
             stack_offset = 72;
 
+            char* param_scan = paren + 1;
+            int param_idx = 0;
+
+            if (has_self) {
+                /* self is passed as pointer in r3 */
+                printf("    stw r3, %d(r1)    ; param self (ptr)\n", stack_offset);
+                strcpy(vars[var_count].name, "self");
+                vars[var_count].offset = stack_offset;
+                vars[var_count].type = TYPE_REF;
+                vars[var_count].size = 4;
+                var_count++;
+                stack_offset += 4;
+                param_idx = 1;
+                /* Skip past self in param list */
+                while (*param_scan && *param_scan != ',' && *param_scan != ')') param_scan++;
+                if (*param_scan == ',') param_scan++;
+            }
+
             while (param_scan && *param_scan && *param_scan != ')' && param_idx < param_count) {
-                /* Skip whitespace */
                 while (*param_scan && isspace(*param_scan)) param_scan++;
                 if (*param_scan == ')') break;
-                /* Skip &, mut, self */
                 if (*param_scan == '&') param_scan++;
                 while (*param_scan && isspace(*param_scan)) param_scan++;
                 if (strncmp(param_scan, "mut ", 4) == 0) param_scan += 4;
                 while (*param_scan && isspace(*param_scan)) param_scan++;
-                /* Parse param name */
                 char pname[64] = {0};
                 int pni = 0;
                 while (*param_scan && (isalnum(*param_scan) || *param_scan == '_') && pni < 63) {
                     pname[pni++] = *param_scan++;
                 }
                 pname[pni] = '\0';
-                /* Skip ": Type" */
                 while (*param_scan && *param_scan != ',' && *param_scan != ')') param_scan++;
                 if (*param_scan == ',') param_scan++;
 
@@ -2402,6 +2605,10 @@ void compile_rust(char* source) {
                 }
                 param_idx++;
             }
+
+            /* Store impl struct index for self.field resolution */
+            int save_impl_struct = current_impl_struct;
+            current_impl_struct = impl_struct_idx;
 
             pos = body + 1;
             compile_function_body(256);
@@ -2426,6 +2633,7 @@ void compile_rust(char* source) {
             pos = save_pos;
             var_count = save_var_count;
             stack_offset = save_stack_offset;
+            current_impl_struct = save_impl_struct;
 
             scan = bp;
         }
