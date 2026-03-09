@@ -492,8 +492,24 @@ RustType parse_type() {
                 return TYPE_STRUCT;
             }
         }
-        /* Unknown type — skip any generics and return as struct */
+        /* Check for macro invocation: TypeName!(...) or TypeName![...] or TypeName!{...} */
         skip_whitespace();
+        if (*pos == '!') {
+            pos++; /* skip ! */
+            skip_whitespace();
+            if (*pos == '(' || *pos == '[' || *pos == '{') {
+                char open = *pos;
+                char close = (open == '(') ? ')' : (open == '{') ? '}' : ']';
+                int d = 1; pos++;
+                while (*pos && d > 0) {
+                    if (*pos == open) d++;
+                    else if (*pos == close) d--;
+                    pos++;
+                }
+            }
+            return TYPE_STRUCT;
+        }
+        /* Unknown type — skip any generics */
         if (*pos == '<') skip_generic_params();
         return TYPE_STRUCT;
     }
@@ -2259,6 +2275,17 @@ void compile_rust(char* source) {
                         if (*pos == ']') pos++;
                         continue;
                     }
+                    /* Skip @ attributes like @size(16), @align(16) */
+                    if (*pos == '@') {
+                        pos++;
+                        while (*pos && (isalnum(*pos) || *pos == '_')) pos++;
+                        if (*pos == '(') {
+                            int d = 1; pos++;
+                            while (*pos && d > 0) { if (*pos == '(') d++; else if (*pos == ')') d--; pos++; }
+                        }
+                        skip_whitespace();
+                        continue;
+                    }
                     /* Skip macro metavariables $(...) */
                     if (*pos == '$') {
                         if (*(pos+1) == '(') {
@@ -2287,6 +2314,12 @@ void compile_rust(char* source) {
                     }
                     fname[fi] = '\0';
                     skip_whitespace();
+                    if (*pos == '=') {
+                        /* key = value (macro syntax, not a real field) — skip to comma */
+                        while (*pos && *pos != ',' && *pos != '}') pos++;
+                        if (*pos == ',') pos++;
+                        continue;
+                    }
                     if (*pos == ':') pos++;
                     skip_whitespace();
                     /* Parse field type */
@@ -2329,6 +2362,37 @@ void compile_rust(char* source) {
                 while (*pos && *pos != ')') {
                     skip_whitespace();
                     if (*pos == ')') break;
+                    /* Skip comments inside tuple struct */
+                    if (*pos == '/' && *(pos+1) == '/') {
+                        while (*pos && *pos != '\n') pos++;
+                        if (*pos == '\n') pos++;
+                        continue;
+                    }
+                    if (*pos == '/' && *(pos+1) == '*') {
+                        pos += 2;
+                        while (*pos && !(*pos == '*' && *(pos+1) == '/')) pos++;
+                        if (*pos) pos += 2;
+                        continue;
+                    }
+                    /* Skip attributes (#[...]) and @ attributes (@size(N)) */
+                    if (*pos == '#' && *(pos+1) == '[') {
+                        while (*pos && *pos != ']') pos++;
+                        if (*pos == ']') pos++;
+                        continue;
+                    }
+                    if (*pos == '@') {
+                        pos++;
+                        while (*pos && (isalnum(*pos) || *pos == '_')) pos++;
+                        if (*pos == '(') {
+                            int d = 1; pos++;
+                            while (*pos && d > 0) { if (*pos == '(') d++; else if (*pos == ')') d--; pos++; }
+                        }
+                        skip_whitespace();
+                        continue;
+                    }
+                    /* Skip pub keyword */
+                    if (strncmp(pos, "pub ", 4) == 0) pos += 4;
+                    if (strncmp(pos, "pub(crate) ", 11) == 0) pos += 11;
                     /* Safety: skip => (macro syntax) and other non-type chars */
                     if (*pos == '=' && *(pos+1) == '>') {
                         pos += 2;
