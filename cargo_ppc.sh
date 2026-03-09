@@ -108,6 +108,44 @@ EOF
         echo "Created project $NAME"
         ;;
 
+    fetch)
+        shift
+        echo "; cargo_ppc fetch — downloading dependencies"
+
+        # Find project root
+        PROJECT_DIR="."
+        while [ ! -f "$PROJECT_DIR/Cargo.toml" ] && [ "$PROJECT_DIR" != "/" ]; do
+            PROJECT_DIR="$(dirname "$PROJECT_DIR")"
+        done
+
+        if [ ! -f "$PROJECT_DIR/Cargo.lock" ]; then
+            echo "Error: No Cargo.lock found (run 'cargo generate-lockfile' first)"
+            exit 1
+        fi
+
+        python3 "$SCRIPT_DIR/cargo_fetch.py" fetch "$PROJECT_DIR" "$@"
+        ;;
+
+    vendor)
+        shift
+        echo "; cargo_ppc vendor — fetch + skip platform-specific crates"
+
+        PROJECT_DIR="."
+        while [ ! -f "$PROJECT_DIR/Cargo.toml" ] && [ "$PROJECT_DIR" != "/" ]; do
+            PROJECT_DIR="$(dirname "$PROJECT_DIR")"
+        done
+
+        python3 "$SCRIPT_DIR/cargo_fetch.py" fetch "$PROJECT_DIR" --skip-platform "$@"
+        ;;
+
+    deps)
+        shift
+        echo "; cargo_ppc deps — dependency info"
+
+        PROJECT_DIR="${1:-.}"
+        python3 "$SCRIPT_DIR/cargo_fetch.py" info "$PROJECT_DIR"
+        ;;
+
     rustc)
         # Direct rustc passthrough
         shift
@@ -132,6 +170,9 @@ EOF
         echo "  test      Run tests"
         echo "  clean     Remove target directory"
         echo "  new       Create a new project"
+        echo "  fetch     Download all dependencies from crates.io"
+        echo "  vendor    Fetch deps, skip platform-incompatible crates"
+        echo "  deps      Show dependency summary"
         echo "  rustc     Direct rustc_ppc invocation"
         echo "  version   Show version info"
         echo ""
