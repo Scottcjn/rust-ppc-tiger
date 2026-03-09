@@ -299,6 +299,21 @@ void emit_drop_glue(Variable* var) {
     }
 }
 
+/* Simple hash of filename for unique labels */
+static unsigned int file_hash(const char* filename) {
+    unsigned int h = 5381;
+    const char* p = filename;
+    /* Use just the basename */
+    const char* slash = strrchr(filename, '/');
+    if (slash) p = slash + 1;
+    while (*p) {
+        h = ((h << 5) + h) ^ (unsigned char)*p++;
+    }
+    return h & 0xFFFF;  /* 16-bit hash */
+}
+
+static unsigned int current_file_hash = 0;
+
 void compile_rust(char* source) {
     pos = source;
     
@@ -430,12 +445,12 @@ void compile_rust(char* source) {
     
     printf(".text\n.align 2\n");
     
-    /* Generate vtables for traits */
+    /* Generate vtables for traits — labels include file hash for uniqueness */
     int i;
     for (i = 0; i < trait_count; i++) {
         printf("\n; Vtable for trait %s\n", traits[i].name);
         printf(".section __DATA,__const\n");
-        printf("_vtable_%s:\n", traits[i].name);
+        printf("_vtable_%s_%04x:\n", traits[i].name, current_file_hash);
         printf("    .long 0  ; Size\n");
         printf("    .long 4  ; Alignment\n");
         printf("    .long 0  ; Destructor\n");
@@ -1169,13 +1184,16 @@ void compile_rust(char* source) {
     printf("    ; Would iterate and push all elements\n");
     printf("    blr\n");
     
-    /* External functions */
-    printf("\n; External functions\n");
-    printf(".section __TEXT,__text\n");
+    /* External functions — use non-lazy symbol pointers for Tiger's as(1) */
+    printf("\n; External symbol pointers (non-lazy)\n");
+    printf(".section __DATA,__nl_symbol_ptr,non_lazy_symbol_pointers\n");
     printf(".align 2\n");
-    printf("\n; Import malloc/free from libc\n");
-    printf(".indirect_symbol _malloc\n");
-    printf(".indirect_symbol _free\n");
+    printf("L_malloc_ptr:\n");
+    printf("    .indirect_symbol _malloc\n");
+    printf("    .long 0\n");
+    printf("L_free_ptr:\n");
+    printf("    .indirect_symbol _free\n");
+    printf("    .long 0\n");
 }
 
 int main(int argc, char** argv) {
@@ -1199,6 +1217,7 @@ int main(int argc, char** argv) {
     source[size] = 0;
     fclose(f);
     
+    current_file_hash = file_hash(argv[1]);
     compile_rust(source);
     free(source);
     
