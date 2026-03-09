@@ -189,7 +189,26 @@ void skip_generic_params() {
     pos++;
     while (*pos && depth > 0) {
         if (*pos == '<') depth++;
-        else if (*pos == '>') depth--;
+        else if (*pos == '>') {
+            /* Don't count > in -> as closing generic */
+            if (*(pos-1) == '-') {
+                pos++;
+                continue;
+            }
+            depth--;
+        } else if (*pos == '(' || *pos == '[' || *pos == '{') {
+            /* Skip nested parens/brackets/braces inside generics */
+            char open = *pos;
+            char close = (open == '(') ? ')' : (open == '{') ? '}' : ']';
+            int inner = 1;
+            pos++;
+            while (*pos && inner > 0) {
+                if (*pos == open) inner++;
+                else if (*pos == close) inner--;
+                pos++;
+            }
+            continue;
+        }
         pos++;
     }
 }
@@ -197,7 +216,45 @@ void skip_generic_params() {
 RustType parse_type() {
     skip_whitespace();
 
-    if (*pos == '[') {
+    /* Skip lifetime annotations: 'a, 'static, 'lifetime, etc. */
+    if (*pos == '\'' && (isalpha(*(pos+1)) || *(pos+1) == '_')) {
+        pos++; /* skip apostrophe */
+        while (*pos && (isalnum(*pos) || *pos == '_')) pos++;
+        skip_whitespace();
+        /* After lifetime, might have + for trait bounds: 'a + Send */
+        while (*pos == '+') {
+            pos++;
+            skip_whitespace();
+            while (*pos && (isalnum(*pos) || *pos == '_' || *pos == ':')) pos++;
+            skip_whitespace();
+        }
+    }
+
+    /* Skip #[...] attributes (e.g., #[from] in enum variants) */
+    while (*pos == '#' && *(pos+1) == '[') {
+        pos += 2;
+        int bracket_depth = 1;
+        while (*pos && bracket_depth > 0) {
+            if (*pos == '[') bracket_depth++;
+            else if (*pos == ']') bracket_depth--;
+            pos++;
+        }
+        skip_whitespace();
+    }
+
+    if (*pos == '<') {
+        /* Qualified type: <Type as Trait>::AssocType or <T>::Item */
+        skip_generic_params();
+        skip_whitespace();
+        /* Skip :: and associated type name */
+        if (*pos == ':' && *(pos+1) == ':') {
+            pos += 2;
+            while (*pos && (isalnum(*pos) || *pos == '_')) pos++;
+            skip_whitespace();
+            if (*pos == '<') skip_generic_params();
+        }
+        return TYPE_STRUCT;
+    } else if (*pos == '[') {
         /* Array type: [Type; N] or slice [Type] */
         pos++;
         parse_type(); /* skip element type */
@@ -233,6 +290,12 @@ RustType parse_type() {
     } else if (*pos == '&') {
         pos++;
         skip_whitespace();
+        /* Skip lifetime after &: &'a T, &'static T */
+        if (*pos == '\'' && (isalpha(*(pos+1)) || *(pos+1) == '_')) {
+            pos++;
+            while (*pos && (isalnum(*pos) || *pos == '_')) pos++;
+            skip_whitespace();
+        }
         if (strncmp(pos, "mut ", 4) == 0) {
             pos += 4;
             parse_type(); /* skip inner type */
@@ -258,8 +321,10 @@ RustType parse_type() {
     } else if (strncmp(pos, "Result<", 7) == 0) {
         pos += 6; skip_generic_params();
         return TYPE_RESULT;
-    } else if (strncmp(pos, "String", 6) == 0) {
+    } else if (strncmp(pos, "String", 6) == 0 && !isalnum(*(pos+6)) && *(pos+6) != '_') {
         pos += 6;
+        skip_whitespace();
+        if (*pos == '<') skip_generic_params(); /* String<'bump> etc. */
         return TYPE_STRING;
     } else if (strncmp(pos, "str", 3) == 0) {
         pos += 3;
@@ -272,8 +337,100 @@ RustType parse_type() {
         return TYPE_CHAR;
     } else if (strncmp(pos, "dyn ", 4) == 0) {
         pos += 4;
-        parse_type(); /* skip trait */
+        skip_whitespace();
+        /* Skip for<'a> higher-ranked trait bounds */
+        if (strncmp(pos, "for<", 4) == 0) {
+            pos += 3;
+            skip_generic_params();
+            skip_whitespace();
+        }
+        /* Handle Fn/FnMut/FnOnce trait objects with (...) -> T syntax */
+        if (strncmp(pos, "FnOnce", 6) == 0 || strncmp(pos, "FnMut", 5) == 0 || strncmp(pos, "Fn(", 3) == 0) {
+            while (*pos && (isalnum(*pos) || *pos == '_')) pos++;
+            skip_whitespace();
+            if (*pos == '(') {
+                int pd = 1; pos++;
+                while (*pos && pd > 0) { if (*pos == '(') pd++; else if (*pos == ')') pd--; pos++; }
+            }
+            skip_whitespace();
+            if (*pos == '-' && *(pos+1) == '>') {
+                pos += 2;
+                skip_whitespace();
+                parse_type();
+            }
+        } else {
+            parse_type(); /* skip trait name */
+        }
+        /* Handle + Send + Sync + 'static etc. */
+        skip_whitespace();
+        while (*pos == '+') {
+            pos++;
+            skip_whitespace();
+            /* Skip lifetime like 'static */
+            if (*pos == '\'' && (isalpha(*(pos+1)) || *(pos+1) == '_')) {
+                pos++;
+                while (*pos && (isalnum(*pos) || *pos == '_')) pos++;
+            } else {
+                parse_type(); /* skip next trait bound */
+            }
+            skip_whitespace();
+        }
         return TYPE_TRAIT_OBJ;
+    } else if ((strncmp(pos, "fn(", 3) == 0) || (strncmp(pos, "fn (", 4) == 0) ||
+               (strncmp(pos, "unsafe fn", 9) == 0) ||
+               (strncmp(pos, "extern ", 7) == 0 && strstr(pos, "fn") != NULL && (strstr(pos, "fn") - pos) < 20) ||
+               (strncmp(pos, "for<", 4) == 0)) {
+        /* Function pointer type: fn(...) -> T, unsafe fn(...), extern "C" fn(...), for<'a> Fn(...) */
+        /* Skip qualifiers */
+        if (strncmp(pos, "for<", 4) == 0) {
+            pos += 3;
+            skip_generic_params();
+            skip_whitespace();
+        }
+        if (strncmp(pos, "unsafe ", 7) == 0) pos += 7;
+        if (strncmp(pos, "extern ", 7) == 0) {
+            pos += 7;
+            skip_whitespace();
+            if (*pos == '"') { pos++; while (*pos && *pos != '"') pos++; if (*pos == '"') pos++; }
+            skip_whitespace();
+        }
+        /* Skip fn/Fn/FnMut/FnOnce */
+        if (strncmp(pos, "fn", 2) == 0) { pos += 2; }
+        else if (strncmp(pos, "FnOnce", 6) == 0) { pos += 6; }
+        else if (strncmp(pos, "FnMut", 5) == 0) { pos += 5; }
+        else if (strncmp(pos, "Fn", 2) == 0) { pos += 2; }
+        skip_whitespace();
+        /* Skip parameter list (...) */
+        if (*pos == '(') {
+            int paren_depth = 1;
+            pos++;
+            while (*pos && paren_depth > 0) {
+                if (*pos == '(') paren_depth++;
+                else if (*pos == ')') paren_depth--;
+                pos++;
+            }
+        }
+        skip_whitespace();
+        /* Skip return type -> T */
+        if (*pos == '-' && *(pos+1) == '>') {
+            pos += 2;
+            skip_whitespace();
+            parse_type();
+        }
+        /* Handle + Send + Sync + 'static etc. */
+        skip_whitespace();
+        while (*pos == '+') {
+            pos++;
+            skip_whitespace();
+            if (*pos == '\'' && (isalpha(*(pos+1)) || *(pos+1) == '_')) {
+                pos++;
+                while (*pos && (isalnum(*pos) || *pos == '_')) pos++;
+            } else {
+                parse_type();
+            }
+            skip_whitespace();
+        }
+        return TYPE_STRUCT; /* fn pointers are pointer-sized */
     } else if (strncmp(pos, "i128", 4) == 0) {
         pos += 4;
         return TYPE_I128;
@@ -312,12 +469,18 @@ RustType parse_type() {
         return TYPE_F32;
     }
     
-    /* Check if it's a known struct type */
+    /* Check if it's a known struct type or path-qualified type */
     if (isalpha(*pos) || *pos == '_') {
         char type_name[64] = {0};
         int ti = 0;
-        while (*pos && (isalnum(*pos) || *pos == '_') && ti < 63) {
-            type_name[ti++] = *pos++;
+        /* Parse type name including :: path separators (e.g., std::io::Error, twomg::TwoMgHeader) */
+        while (*pos && (isalnum(*pos) || *pos == '_' || (*pos == ':' && *(pos+1) == ':')) && ti < 63) {
+            if (*pos == ':' && *(pos+1) == ':') {
+                type_name[ti++] = *pos++;
+                if (ti < 63) type_name[ti++] = *pos++;
+            } else {
+                type_name[ti++] = *pos++;
+            }
         }
         type_name[ti] = '\0';
         /* Check if it's a known struct */
@@ -2096,10 +2259,26 @@ void compile_rust(char* source) {
                         if (*pos == ']') pos++;
                         continue;
                     }
+                    /* Skip macro metavariables $(...) */
+                    if (*pos == '$') {
+                        if (*(pos+1) == '(') {
+                            int d = 1; pos += 2;
+                            while (*pos && d > 0) { if (*pos == '(') d++; else if (*pos == ')') d--; pos++; }
+                            /* Skip optional repeat operator: *, +, ? */
+                            while (*pos == '*' || *pos == '+' || *pos == '?') pos++;
+                        } else {
+                            pos++; /* skip $ */
+                            while (*pos && (isalnum(*pos) || *pos == '_')) pos++; /* skip $ident */
+                        }
+                        continue;
+                    }
                     /* Skip pub keyword */
                     if (strncmp(pos, "pub ", 4) == 0) pos += 4;
                     if (strncmp(pos, "pub(crate) ", 11) == 0) pos += 11;
+                    if (strncmp(pos, "pub(super) ", 11) == 0) pos += 11;
                     skip_whitespace();
+                    /* Skip r# raw identifier prefix */
+                    if (*pos == 'r' && *(pos+1) == '#') pos += 2;
                     /* Parse field name */
                     char fname[32] = {0};
                     int fi = 0;
@@ -2150,7 +2329,19 @@ void compile_rust(char* source) {
                 while (*pos && *pos != ')') {
                     skip_whitespace();
                     if (*pos == ')') break;
+                    /* Safety: skip => (macro syntax) and other non-type chars */
+                    if (*pos == '=' && *(pos+1) == '>') {
+                        pos += 2;
+                        skip_whitespace();
+                        continue;
+                    }
+                    char *before_parse = pos;
                     RustType ftype = parse_type();
+                    /* Safety: if parse_type didn't advance, skip one char to avoid infinite loop */
+                    if (pos == before_parse) {
+                        pos++;
+                        continue;
+                    }
                     int fsize = 4;
                     switch (ftype) {
                         case TYPE_I8: case TYPE_U8: case TYPE_BOOL: fsize = 1; break;
@@ -2233,6 +2424,26 @@ void compile_rust(char* source) {
                     }
                     vname[vi] = '\0';
 
+                    /* Safety: if we couldn't parse a variant name, skip to next comma/brace */
+                    if (vi == 0) {
+                        while (*pos && *pos != ',' && *pos != '}') {
+                            if (*pos == '(' || *pos == '{' || *pos == '[') {
+                                int d = 1; char open = *pos;
+                                char close = (open == '(') ? ')' : (open == '{') ? '}' : ']';
+                                pos++;
+                                while (*pos && d > 0) {
+                                    if (*pos == open) d++;
+                                    else if (*pos == close) d--;
+                                    pos++;
+                                }
+                            } else {
+                                pos++;
+                            }
+                        }
+                        if (*pos == ',') pos++;
+                        continue;
+                    }
+
                     int payload_size = 0;
                     if (*pos == '(') {
                         /* Tuple variant: Variant(Type, Type) */
@@ -2240,7 +2451,9 @@ void compile_rust(char* source) {
                         while (*pos && *pos != ')') {
                             skip_whitespace();
                             if (*pos == ')') break;
+                            char *before = pos;
                             parse_type();
+                            if (pos == before) { pos++; continue; } /* safety: avoid infinite loop */
                             payload_size += 4;
                             skip_whitespace();
                             if (*pos == ',') pos++;
@@ -2271,12 +2484,33 @@ void compile_rust(char* source) {
                         }
                         if (*pos == '}') pos++;
                     }
-                    /* = value for C-like enums */
+                    /* = value or => value for C-like enums */
                     skip_whitespace();
-                    if (*pos == '=') {
+                    if (*pos == '=' && *(pos+1) == '>') {
+                        /* => value (macro-generated enum syntax) */
+                        pos += 2;
+                        skip_whitespace();
+                        /* Skip complex value expressions until comma or closing brace */
+                        int depth = 0;
+                        while (*pos && !(depth == 0 && (*pos == ',' || *pos == '}'))) {
+                            if (*pos == '(' || *pos == '[' || *pos == '{') depth++;
+                            else if (*pos == ')' || *pos == ']' || *pos == '}') {
+                                if (depth > 0) depth--; else break;
+                            }
+                            pos++;
+                        }
+                    } else if (*pos == '=') {
                         pos++;
                         skip_whitespace();
-                        parse_number();
+                        /* Skip complex value expression (not just numbers - could be make_tag(b"...")) */
+                        int depth = 0;
+                        while (*pos && !(depth == 0 && (*pos == ',' || *pos == '}'))) {
+                            if (*pos == '(' || *pos == '[' || *pos == '{') depth++;
+                            else if (*pos == ')' || *pos == ']' || *pos == '}') {
+                                if (depth > 0) depth--; else break;
+                            }
+                            pos++;
+                        }
                     }
 
                     if (payload_size > max_payload) max_payload = payload_size;
@@ -2379,13 +2613,22 @@ void compile_rust(char* source) {
             pos += 7;
             
         } else if (strncmp(pos, "use ", 4) == 0) {
-            /* Import */
-            pos += 4;
-            
+            /* Import — skip the entire use statement to avoid keyword collisions */
+            while (*pos && *pos != ';' && *pos != '\n') {
+                if (*pos == '{') {
+                    int d = 1; pos++;
+                    while (*pos && d > 0) { if (*pos == '{') d++; else if (*pos == '}') d--; pos++; }
+                    continue;
+                }
+                pos++;
+            }
+
         } else if (strncmp(pos, "mod ", 4) == 0) {
-            /* Module */
+            /* Module — skip the module name to avoid matching keywords in it */
             pos += 4;
-            
+            skip_whitespace();
+            while (*pos && (isalnum(*pos) || *pos == '_')) pos++; /* skip module name */
+
         } else if (strncmp(pos, "macro_rules!", 12) == 0) {
             /* Declarative macro */
             pos += 12;
