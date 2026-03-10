@@ -987,6 +987,12 @@ int efs_sync_metadata(void *a) { (void)a; return 0; }
 /* Device enumeration */
 void *enumerate_devices(void) { return NULL; }
 
+/* New sanitized path symbols from :: → _ transform */
+void *Local_now(void) { return NULL; }
+void *Mbr_parse(void *a) { (void)a; return NULL; }
+void *TempDir_new(void) { return NULL; }
+int fs_read(const char *path) { (void)path; return 0; }
+
 /* Threading stub */
 void *thread(void *func) { (void)func; return NULL; }
 

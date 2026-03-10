@@ -604,6 +604,30 @@ void compile_function_body(int frame_size);
  * PPC `li` only handles -32768..32767 (signed 16-bit).
  * For larger values, use `lis` (upper 16) + `ori` (lower 16).
  */
+/* Sanitize a Rust path into a valid PPC assembly label.
+ * Replaces :: with _, strips <>, spaces, and other non-label chars.
+ * Returns static buffer — not thread-safe but fine for single-pass compiler.
+ */
+const char* sanitize_label(const char* name) {
+    static char buf[256];
+    int j = 0;
+    for (int i = 0; name[i] && j < 254; i++) {
+        if (name[i] == ':' && name[i+1] == ':') {
+            buf[j++] = '_';
+            i++; /* skip second : */
+        } else if (name[i] == '<' || name[i] == '>' || name[i] == ' '
+                || name[i] == ',' || name[i] == '&' || name[i] == '\'') {
+            /* skip angle brackets, spaces, etc */
+        } else if (isalnum(name[i]) || name[i] == '_') {
+            buf[j++] = name[i];
+        } else {
+            buf[j++] = '_';
+        }
+    }
+    buf[j] = '\0';
+    return buf;
+}
+
 void emit_li(int reg, int value) {
     if (value >= -32768 && value <= 32767) {
         printf("    li r%d, %d\n", reg, value);
@@ -1487,7 +1511,7 @@ void compile_function_body(int frame_size) {
                             if (*pos == ',') pos++;
                         }
                         if (*pos == ')') pos++;
-                        printf("    bl _%s\n", ref_name);
+                        printf("    bl _%s\n", sanitize_label(ref_name));
                         printf("    stw r3, %d(r1)   ; %s = result\n", stack_offset, var_name);
                     } else {
                         /* Variable reference, possibly with binary op: let x = a + b */
@@ -2106,7 +2130,8 @@ void compile_function_body(int frame_size) {
                             printf("    lwz r3, %d(r1)\n", var_off + 4);
                         } else {
                             printf("    la r3, %d(r1)\n", var_off);
-                            printf("    bl _%s_%s\n", obj_name, method);
+                            { char mname[256]; snprintf(mname, sizeof(mname), "%s_%s", obj_name, method);
+                            printf("    bl _%s\n", sanitize_label(mname)); }
                         }
                         while (*pos && *pos != ')') pos++;
                         if (*pos == ')') pos++;
@@ -2243,7 +2268,7 @@ void compile_function_body(int frame_size) {
                     if (*pos == ',') pos++;
                 }
                 if (*pos == ')') pos++;
-                printf("    bl _%s\n", obj_name);
+                printf("    bl _%s\n", sanitize_label(obj_name));
                 while (*pos && *pos != ';') pos++;
                 if (*pos == ';') pos++;
 
