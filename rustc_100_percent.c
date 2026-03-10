@@ -1027,7 +1027,7 @@ void compile_function_body(int frame_size) {
                         printf("    .text\n");
                         string_label_count++;
                         emit_li(3, si + 1);
-                        printf("    bl _malloc\n");
+                        printf("    bl L_malloc$stub\n");
                         printf("    stw r3, %d(r1)    ; String ptr\n", stack_offset);
                         emit_li(4, si);
                         printf("    stw r4, %d(r1)    ; String len\n", stack_offset + 4);
@@ -2265,6 +2265,44 @@ void compile_function_body(int frame_size) {
     /* Don't restore var_count — locals remain visible for drop glue if needed */
 }
 
+/* Emit PIC symbol stubs for malloc/free — required on Tiger PPC.
+ * Must be called at end of every translation unit.
+ */
+void emit_pic_stubs(void) {
+    printf("\n    .section __TEXT,__picsymbolstub1,symbol_stubs,pure_instructions,32\n");
+    printf("    .align 5\n");
+    printf("L_malloc$stub:\n");
+    printf("    .indirect_symbol _malloc\n");
+    printf("    mflr r0\n");
+    printf("    bcl 20,31,\"L_malloc$spb\"\n");
+    printf("\"L_malloc$spb\":\n");
+    printf("    mflr r11\n");
+    printf("    addis r11,r11,ha16(L_malloc$lazy_ptr-\"L_malloc$spb\")\n");
+    printf("    mtlr r0\n");
+    printf("    lwzu r12,lo16(L_malloc$lazy_ptr-\"L_malloc$spb\")(r11)\n");
+    printf("    mtctr r12\n");
+    printf("    bctr\n");
+    printf("L_free$stub:\n");
+    printf("    .indirect_symbol _free\n");
+    printf("    mflr r0\n");
+    printf("    bcl 20,31,\"L_free$spb\"\n");
+    printf("\"L_free$spb\":\n");
+    printf("    mflr r11\n");
+    printf("    addis r11,r11,ha16(L_free$lazy_ptr-\"L_free$spb\")\n");
+    printf("    mtlr r0\n");
+    printf("    lwzu r12,lo16(L_free$lazy_ptr-\"L_free$spb\")(r11)\n");
+    printf("    mtctr r12\n");
+    printf("    bctr\n");
+    printf("    .lazy_symbol_pointer\n");
+    printf("L_malloc$lazy_ptr:\n");
+    printf("    .indirect_symbol _malloc\n");
+    printf("    .long dyld_stub_binding_helper\n");
+    printf("L_free$lazy_ptr:\n");
+    printf("    .indirect_symbol _free\n");
+    printf("    .long dyld_stub_binding_helper\n");
+    printf("    .subsections_via_symbols\n");
+}
+
 void compile_rust(char* source) {
     pos = source;
     
@@ -3106,16 +3144,8 @@ void compile_rust(char* source) {
             printf("\n; impl %s for %s\n", impls[i].trait_name, impls[i].struct_name);
         }
 
-        /* External symbol pointers */
-        printf("\n; External symbol pointers (non-lazy)\n");
-        printf(".section __DATA,__nl_symbol_ptr,non_lazy_symbol_pointers\n");
-        printf(".align 2\n");
-        printf("L_malloc_ptr:\n");
-        printf("    .indirect_symbol _malloc\n");
-        printf("    .long 0\n");
-        printf("L_free_ptr:\n");
-        printf("    .indirect_symbol _free\n");
-        printf("    .long 0\n");
+        /* PIC symbol stubs for external calls */
+        emit_pic_stubs();
         return;
     }
 
@@ -3164,17 +3194,17 @@ void compile_rust(char* source) {
     printf("\n.align 2\n");
     printf("_alloc_box:\n");
     printf("    ; r3 = size, return pointer in r3\n");
-    printf("    b _malloc         ; Use system malloc for now\n");
+    printf("    b L_malloc$stub   ; Use system malloc for now\n");
     
     printf("\n.align 2\n");
     printf("_dealloc_box:\n");
     printf("    ; r3 = pointer\n");
-    printf("    b _free           ; Use system free\n");
+    printf("    b L_free$stub     ; Use system free\n");
     
     printf("\n.align 2\n");
     printf("_alloc_rc:\n");
     printf("    ; Allocate with reference count\n");
-    printf("    b _malloc\n");
+    printf("    b L_malloc$stub\n");
     
     printf("\n.align 2\n");
     printf("_rc_decrement:\n");
@@ -3184,13 +3214,13 @@ void compile_rust(char* source) {
     printf("    stw r4, 0(r3)     ; store back\n");
     printf("    cmpwi r4, 0\n");
     printf("    bne 1f\n");
-    printf("    b _free           ; free if zero\n");
+    printf("    b L_free$stub     ; free if zero\n");
     printf("1:  blr\n");
     
     printf("\n.align 2\n");
     printf("_alloc_arc:\n");
     printf("    ; Allocate with atomic reference count\n");
-    printf("    b _malloc\n");
+    printf("    b L_malloc$stub\n");
     
     printf("\n.align 2\n");
     printf("_arc_decrement:\n");
@@ -3201,7 +3231,7 @@ void compile_rust(char* source) {
     printf("    bne- _arc_decrement ; retry if failed\n");
     printf("    cmpwi r4, 0\n");
     printf("    bne 1f\n");
-    printf("    b _free           ; free if zero\n");
+    printf("    b L_free$stub     ; free if zero\n");
     printf("1:  blr\n");
     
     printf("\n.align 2\n");
@@ -3211,13 +3241,13 @@ void compile_rust(char* source) {
     printf("    stw r0, 8(r1)\n");
     printf("    stwu r1, -48(r1)\n");
     printf("    li r3, 12         ; Vec struct size\n");
-    printf("    bl _malloc\n");
+    printf("    bl L_malloc$stub\n");
     printf("    stw r3, 24(r1)    ; save Vec ptr\n");
     printf("    li r4, 16         ; initial capacity (4 elements)\n");
     printf("    stw r4, 28(r1)    ; save cap request\n");
     printf("    mr r14, r3        ; save vec ptr\n");
     printf("    li r3, 16         ; alloc buffer for 4 i32 elements\n");
-    printf("    bl _malloc\n");
+    printf("    bl L_malloc$stub\n");
     printf("    lwz r14, 24(r1)   ; restore vec ptr\n");
     printf("    stw r3, 0(r14)    ; ptr = buffer\n");
     printf("    li r4, 0\n");
@@ -3263,7 +3293,7 @@ void compile_rust(char* source) {
     printf("    lwz r3, 0(r3)     ; load data ptr\n");
     printf("    cmpwi r3, 0\n");
     printf("    beq 1f\n");
-    printf("    b _free           ; free data\n");
+    printf("    b L_free$stub     ; free data\n");
     printf("1:  blr\n");
     
     printf("\n.align 2\n");
@@ -3275,7 +3305,7 @@ void compile_rust(char* source) {
     printf("_create_future:\n");
     printf("    ; Create Future for async\n");
     printf("    li r3, 16         ; Future size\n");
-    printf("    b _malloc\n");
+    printf("    b L_malloc$stub\n");
     
     printf("\n.align 2\n");
     printf("_await_future:\n");
@@ -3344,7 +3374,7 @@ void compile_rust(char* source) {
     printf("    li r4, 16         ; Iterator size\n");
     printf("    mr r5, r3         ; save collection\n");
     printf("    li r3, 16\n");
-    printf("    bl _malloc\n");
+    printf("    bl L_malloc$stub\n");
     printf("    stw r5, 0(r3)     ; store collection ptr\n");
     printf("    li r4, 0\n");
     printf("    stw r4, 4(r3)     ; index = 0\n");
@@ -3357,16 +3387,7 @@ void compile_rust(char* source) {
     printf("    ; Would iterate and push all elements\n");
     printf("    blr\n");
     
-    /* External functions — use non-lazy symbol pointers for Tiger's as(1) */
-    printf("\n; External symbol pointers (non-lazy)\n");
-    printf(".section __DATA,__nl_symbol_ptr,non_lazy_symbol_pointers\n");
-    printf(".align 2\n");
-    printf("L_malloc_ptr:\n");
-    printf("    .indirect_symbol _malloc\n");
-    printf("    .long 0\n");
-    printf("L_free_ptr:\n");
-    printf("    .indirect_symbol _free\n");
-    printf("    .long 0\n");
+    emit_pic_stubs();
 }
 
 int main(int argc, char** argv) {
