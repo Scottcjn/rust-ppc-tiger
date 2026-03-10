@@ -7,11 +7,14 @@
  *   - restore         Write backup back to device/image
  *   - inspect         Display backup metadata
  *
- * Partition table support: MBR (with EBR chain), APM, Superfloppy
- * Compression: raw (uncompressed) or gzip (via zlib, available on Tiger)
+ * Features:
+ *   - Partition table support: MBR (with EBR chain), APM, Superfloppy
+ *   - Compression: raw or gzip (via zlib, ships with Tiger)
+ *   - Checksums: CRC32 (via zlib) and SHA-1 (via CommonCrypto)
+ *   - FAT compaction: only backs up allocated clusters (FAT12/16/32)
  *
  * Compiled: gcc -std=c99 -O2 -c rust_cli_real.c
- * Link with: -lz (for gzip compression)
+ * Link with: -lz (for gzip + CRC32)
  */
 
 #include <stdio.h>
@@ -27,6 +30,13 @@
 #include <sys/ioctl.h>
 #include <sys/param.h>
 #include <sys/mount.h>
+#include <zlib.h>
+
+/* CommonCrypto for SHA-1 — available on Tiger 10.4+ */
+#ifdef __APPLE__
+#include <CommonCrypto/CommonDigest.h>
+#define HAVE_SHA1 1
+#endif
 
 #ifdef __APPLE__
 #include <crt_externs.h>
@@ -692,6 +702,682 @@ static const char *detect_alignment(const PartInfo *parts, int count,
 }
 
 /* ============================================================
+ * Checksum Functions (CRC32 via zlib, SHA-1 via CommonCrypto)
+ * ============================================================ */
+
+typedef enum {
+    CKSUM_NONE = 0,
+    CKSUM_CRC32,
+    CKSUM_SHA1
+} ChecksumType;
+
+/* Compute CRC32 of a file and write .crc32 sidecar */
+static uint32_t compute_file_crc32(const char *filepath) {
+    FILE *f = fopen(filepath, "rb");
+    if (!f) return 0;
+
+    uint32_t crc = crc32(0L, Z_NULL, 0);
+    uint8_t buf[CHUNK_SIZE];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof(buf), f)) > 0)
+        crc = crc32(crc, buf, n);
+    fclose(f);
+    return crc;
+}
+
+static void write_crc32_sidecar(const char *filepath, uint32_t crc) {
+    char sidecar[MAX_PATH_LEN];
+    snprintf(sidecar, sizeof(sidecar), "%s.crc32", filepath);
+
+    const char *fname = strrchr(filepath, '/');
+    fname = fname ? fname + 1 : filepath;
+
+    FILE *f = fopen(sidecar, "w");
+    if (f) {
+        fprintf(f, "%08x  %s\n", crc, fname);
+        fclose(f);
+    }
+}
+
+#ifdef HAVE_SHA1
+/* Compute SHA-1 of a file and write .sha1 sidecar */
+static void compute_file_sha1(const char *filepath, char *hex_out) {
+    FILE *f = fopen(filepath, "rb");
+    if (!f) { hex_out[0] = '\0'; return; }
+
+    CC_SHA1_CTX ctx;
+    CC_SHA1_Init(&ctx);
+
+    uint8_t buf[CHUNK_SIZE];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof(buf), f)) > 0)
+        CC_SHA1_Update(&ctx, buf, n);
+    fclose(f);
+
+    unsigned char digest[CC_SHA1_DIGEST_LENGTH];
+    CC_SHA1_Final(digest, &ctx);
+
+    for (int i = 0; i < CC_SHA1_DIGEST_LENGTH; i++)
+        sprintf(&hex_out[i * 2], "%02x", digest[i]);
+    hex_out[CC_SHA1_DIGEST_LENGTH * 2] = '\0';
+}
+
+static void write_sha1_sidecar(const char *filepath, const char *hex) {
+    char sidecar[MAX_PATH_LEN];
+    snprintf(sidecar, sizeof(sidecar), "%s.sha1", filepath);
+
+    const char *fname = strrchr(filepath, '/');
+    fname = fname ? fname + 1 : filepath;
+
+    FILE *f = fopen(sidecar, "w");
+    if (f) {
+        fprintf(f, "%s  %s\n", hex, fname);
+        fclose(f);
+    }
+}
+#endif
+
+static void write_checksum(const char *filepath, ChecksumType type,
+                            char *hex_out, int hexsz) {
+    hex_out[0] = '\0';
+    if (type == CKSUM_CRC32) {
+        uint32_t crc = compute_file_crc32(filepath);
+        snprintf(hex_out, hexsz, "%08x", crc);
+        write_crc32_sidecar(filepath, crc);
+    }
+#ifdef HAVE_SHA1
+    else if (type == CKSUM_SHA1) {
+        compute_file_sha1(filepath, hex_out);
+        write_sha1_sidecar(filepath, hex_out);
+    }
+#endif
+}
+
+/* ============================================================
+ * Gzip Compression (via zlib — ships with Tiger)
+ * ============================================================ */
+
+typedef enum {
+    COMP_RAW = 0,
+    COMP_GZIP
+} CompressionMode;
+
+/* Returns extension string for the compression mode */
+static const char *comp_ext(CompressionMode m) {
+    return m == COMP_GZIP ? ".gz" : ".raw";
+}
+
+/* ============================================================
+ * FAT Compaction — only back up allocated clusters
+ * ============================================================ */
+
+typedef enum { FAT_12, FAT_16, FAT_32 } FatType;
+
+/* Directory entry constants */
+#define DIR_ENTRY_SIZE  32
+#define ATTR_LONG_NAME  0x0F
+#define ATTR_VOLUME_ID  0x08
+#define ATTR_DIRECTORY  0x10
+
+typedef struct {
+    FatType     fat_type;
+    uint16_t    bytes_per_sector;
+    uint8_t     sectors_per_cluster;
+    uint16_t    reserved_sectors;
+    uint8_t     num_fats;
+    uint16_t    root_entry_count;    /* 0 for FAT32 */
+    uint32_t    sectors_per_fat;
+    uint32_t    root_cluster;        /* FAT32 only */
+    uint32_t    total_sectors;
+    uint32_t    total_clusters;
+    uint32_t    data_start_sector;   /* first sector of cluster 2 */
+    uint32_t    root_dir_sectors;    /* FAT12/16 root dir sector count */
+    uint32_t    cluster_size;        /* bytes */
+
+    /* FAT table (in memory) */
+    uint8_t    *fat_data;
+    uint32_t    fat_data_size;
+
+    /* Cluster mapping: allocated[i] = old cluster number for new cluster i+2 */
+    uint32_t   *allocated;           /* old cluster numbers */
+    uint32_t    alloc_count;         /* number of allocated clusters */
+
+    /* Reverse map: old_to_new[old_cluster] = new_cluster (0 = unmapped) */
+    uint32_t   *old_to_new;
+    uint32_t    old_to_new_size;
+
+    /* Directory cluster bitmap */
+    uint8_t    *is_dir_cluster;      /* [total_clusters] flag array */
+
+    /* Source file and partition offset */
+    int         src_fd;
+    off_t       part_offset;         /* absolute byte offset of partition */
+
+    /* Pre-built output sections */
+    uint8_t    *boot_sector;         /* patched BPB + reserved sectors */
+    uint32_t    boot_size;
+    uint8_t    *new_fat;             /* rebuilt FAT table */
+    uint32_t    new_fat_size;
+    uint8_t    *root_dir;            /* FAT12/16 root dir (NULL for FAT32) */
+    uint32_t    root_dir_size;
+
+    /* Virtual stream state */
+    uint64_t    total_output_size;
+    uint64_t    position;
+    uint8_t    *cluster_buf;         /* single cluster buffer */
+    int         cached_cluster;      /* -1 = none */
+} CompactFat;
+
+/* Read a FAT entry */
+static uint32_t fat_read_entry(const uint8_t *fat, uint32_t cluster, FatType type) {
+    switch (type) {
+    case FAT_12: {
+        uint32_t off = (cluster * 3) / 2;
+        uint16_t val = fat[off] | (fat[off + 1] << 8);
+        return (cluster & 1) ? ((val >> 4) & 0xFFF) : (val & 0xFFF);
+    }
+    case FAT_16: {
+        uint32_t off = cluster * 2;
+        return fat[off] | (fat[off + 1] << 8);
+    }
+    case FAT_32: {
+        uint32_t off = cluster * 4;
+        uint32_t val = fat[off] | (fat[off+1]<<8) | (fat[off+2]<<16) | (fat[off+3]<<24);
+        return val & 0x0FFFFFFF;
+    }
+    }
+    return 0;
+}
+
+/* Write a FAT entry */
+static void fat_write_entry(uint8_t *fat, uint32_t cluster, uint32_t value, FatType type) {
+    switch (type) {
+    case FAT_12: {
+        uint32_t off = (cluster * 3) / 2;
+        uint16_t existing = fat[off] | (fat[off + 1] << 8);
+        uint16_t nv;
+        if (cluster & 1)
+            nv = (existing & 0x000F) | ((value & 0xFFF) << 4);
+        else
+            nv = (existing & 0xF000) | (value & 0xFFF);
+        fat[off] = nv & 0xFF;
+        fat[off + 1] = (nv >> 8) & 0xFF;
+        break;
+    }
+    case FAT_16: {
+        uint32_t off = cluster * 2;
+        fat[off] = value & 0xFF;
+        fat[off + 1] = (value >> 8) & 0xFF;
+        break;
+    }
+    case FAT_32: {
+        uint32_t off = cluster * 4;
+        /* preserve high 4 bits */
+        uint32_t existing = fat[off] | (fat[off+1]<<8) | (fat[off+2]<<16) | (fat[off+3]<<24);
+        value = (existing & 0xF0000000) | (value & 0x0FFFFFFF);
+        fat[off]   = value & 0xFF;
+        fat[off+1] = (value >> 8) & 0xFF;
+        fat[off+2] = (value >> 16) & 0xFF;
+        fat[off+3] = (value >> 24) & 0xFF;
+        break;
+    }
+    }
+}
+
+static int fat_is_eoc(uint32_t entry, FatType type) {
+    switch (type) {
+    case FAT_12: return entry >= 0x0FF8;
+    case FAT_16: return entry >= 0xFFF8;
+    case FAT_32: return entry >= 0x0FFFFFF8;
+    }
+    return 0;
+}
+
+static int fat_is_allocated(uint32_t entry, FatType type) {
+    if (entry == 0) return 0;  /* free */
+    if (type == FAT_12 && entry == 0xFF7) return 0;  /* bad */
+    if (type == FAT_16 && entry == 0xFFF7) return 0;
+    if (type == FAT_32 && entry == 0x0FFFFFF7) return 0;
+    return 1;
+}
+
+/* Walk directory tree to identify directory clusters */
+static void fat_mark_dir_clusters(CompactFat *cf, uint32_t start_cluster) {
+    uint32_t cluster = start_cluster;
+    while (cluster >= 2 && cluster < cf->total_clusters + 2) {
+        if (cf->is_dir_cluster[cluster]) break;  /* already visited */
+        cf->is_dir_cluster[cluster] = 1;
+
+        /* Read this cluster and find subdirectory entries */
+        off_t coff = cf->part_offset +
+            (off_t)(cf->data_start_sector + (cluster - 2) * cf->sectors_per_cluster)
+            * cf->bytes_per_sector;
+        uint8_t *dir = (uint8_t *)malloc(cf->cluster_size);
+        if (!dir) break;
+
+        if (lseek(cf->src_fd, coff, SEEK_SET) >= 0 &&
+            read(cf->src_fd, dir, cf->cluster_size) == (ssize_t)cf->cluster_size) {
+            int nent = cf->cluster_size / DIR_ENTRY_SIZE;
+            for (int i = 0; i < nent; i++) {
+                uint8_t *e = &dir[i * DIR_ENTRY_SIZE];
+                if (e[0] == 0x00) break;       /* end of dir */
+                if (e[0] == 0xE5) continue;     /* deleted */
+                if (e[11] == ATTR_LONG_NAME) continue;
+                if (e[11] & ATTR_VOLUME_ID) continue;
+
+                if (e[11] & ATTR_DIRECTORY) {
+                    uint32_t sub = (uint32_t)(e[26] | (e[27]<<8));
+                    if (cf->fat_type == FAT_32)
+                        sub |= ((uint32_t)(e[20] | (e[21]<<8))) << 16;
+                    /* Skip . and .. */
+                    if (e[0] == '.' && (e[1] == ' ' || e[1] == '.')) continue;
+                    if (sub >= 2 && sub < cf->total_clusters + 2)
+                        fat_mark_dir_clusters(cf, sub);
+                }
+            }
+        }
+        free(dir);
+
+        /* Follow chain */
+        uint32_t next = fat_read_entry(cf->fat_data, cluster, cf->fat_type);
+        if (fat_is_eoc(next, cf->fat_type) || next < 2) break;
+        cluster = next;
+    }
+}
+
+/* Patch directory entries: update cluster references to new locations */
+static void fat_patch_dir_entries(CompactFat *cf, uint8_t *data, uint32_t size) {
+    int nent = size / DIR_ENTRY_SIZE;
+    for (int i = 0; i < nent; i++) {
+        uint8_t *e = &data[i * DIR_ENTRY_SIZE];
+        if (e[0] == 0x00) break;
+        if (e[0] == 0xE5) continue;
+        if (e[11] == ATTR_LONG_NAME) continue;
+        if (e[11] & ATTR_VOLUME_ID) continue;
+
+        uint32_t old_c = (uint32_t)(e[26] | (e[27]<<8));
+        if (cf->fat_type == FAT_32)
+            old_c |= ((uint32_t)(e[20] | (e[21]<<8))) << 16;
+
+        if (old_c == 0 || old_c >= cf->old_to_new_size) continue;
+        uint32_t new_c = cf->old_to_new[old_c];
+        if (new_c == 0) continue;
+
+        e[26] = new_c & 0xFF;
+        e[27] = (new_c >> 8) & 0xFF;
+        if (cf->fat_type == FAT_32) {
+            e[20] = (new_c >> 16) & 0xFF;
+            e[21] = (new_c >> 24) & 0xFF;
+        }
+    }
+}
+
+/* Initialize CompactFat reader — returns NULL if not a FAT partition */
+static CompactFat *compact_fat_open(int src_fd, off_t part_offset, uint64_t part_size) {
+    uint8_t bpb[512];
+    if (lseek(src_fd, part_offset, SEEK_SET) < 0) return NULL;
+    if (read(src_fd, bpb, 512) != 512) return NULL;
+
+    /* Check FAT signature */
+    if (bpb[0] != 0xEB && bpb[0] != 0xE9) return NULL;
+    uint16_t bps = read_le16(&bpb[11]);
+    if (bps != 512 && bps != 1024 && bps != 2048 && bps != 4096) return NULL;
+    uint8_t spc = bpb[13];
+    if (spc == 0 || (spc & (spc - 1)) != 0) return NULL;
+    if (bpb[16] != 1 && bpb[16] != 2) return NULL;
+
+    CompactFat *cf = (CompactFat *)calloc(1, sizeof(CompactFat));
+    if (!cf) return NULL;
+
+    cf->src_fd = src_fd;
+    cf->part_offset = part_offset;
+    cf->bytes_per_sector = bps;
+    cf->sectors_per_cluster = spc;
+    cf->reserved_sectors = read_le16(&bpb[14]);
+    cf->num_fats = bpb[16];
+    cf->root_entry_count = read_le16(&bpb[17]);
+    cf->cluster_size = (uint32_t)bps * spc;
+
+    uint16_t spf16 = read_le16(&bpb[22]);
+    uint32_t ts16 = read_le16(&bpb[19]);
+    uint32_t ts32 = read_le32(&bpb[32]);
+    cf->total_sectors = ts16 ? ts16 : ts32;
+
+    /* Determine FAT type */
+    if (spf16 == 0 && cf->root_entry_count == 0) {
+        cf->fat_type = FAT_32;
+        cf->sectors_per_fat = read_le32(&bpb[36]);
+        cf->root_cluster = read_le32(&bpb[44]);
+    } else {
+        cf->sectors_per_fat = spf16;
+        cf->root_dir_sectors = ((cf->root_entry_count * 32) + bps - 1) / bps;
+        cf->data_start_sector = cf->reserved_sectors +
+            cf->num_fats * cf->sectors_per_fat + cf->root_dir_sectors;
+        uint32_t data_sectors = cf->total_sectors - cf->data_start_sector;
+        cf->total_clusters = data_sectors / spc;
+        cf->fat_type = (cf->total_clusters < 4085) ? FAT_12 : FAT_16;
+    }
+
+    if (cf->fat_type == FAT_32) {
+        cf->root_dir_sectors = 0;
+        cf->data_start_sector = cf->reserved_sectors +
+            cf->num_fats * cf->sectors_per_fat;
+        uint32_t data_sectors = cf->total_sectors - cf->data_start_sector;
+        cf->total_clusters = data_sectors / spc;
+    }
+
+    fprintf(stderr, "  [compact] FAT%s, %u clusters, %u bytes/cluster\n",
+            cf->fat_type == FAT_12 ? "12" : cf->fat_type == FAT_16 ? "16" : "32",
+            cf->total_clusters, cf->cluster_size);
+
+    /* Read FAT table into memory */
+    cf->fat_data_size = cf->sectors_per_fat * bps;
+    cf->fat_data = (uint8_t *)malloc(cf->fat_data_size);
+    if (!cf->fat_data) { free(cf); return NULL; }
+
+    off_t fat_off = part_offset + (off_t)cf->reserved_sectors * bps;
+    if (lseek(src_fd, fat_off, SEEK_SET) < 0 ||
+        read(src_fd, cf->fat_data, cf->fat_data_size) != (ssize_t)cf->fat_data_size) {
+        free(cf->fat_data); free(cf); return NULL;
+    }
+
+    /* Scan for allocated clusters */
+    cf->allocated = (uint32_t *)malloc(cf->total_clusters * sizeof(uint32_t));
+    cf->alloc_count = 0;
+    cf->old_to_new_size = cf->total_clusters + 2;
+    cf->old_to_new = (uint32_t *)calloc(cf->old_to_new_size, sizeof(uint32_t));
+    cf->is_dir_cluster = (uint8_t *)calloc(cf->total_clusters + 2, 1);
+
+    for (uint32_t c = 2; c < cf->total_clusters + 2; c++) {
+        uint32_t entry = fat_read_entry(cf->fat_data, c, cf->fat_type);
+        if (fat_is_allocated(entry, cf->fat_type)) {
+            uint32_t new_c = cf->alloc_count + 2;
+            cf->allocated[cf->alloc_count++] = c;
+            cf->old_to_new[c] = new_c;
+        }
+    }
+
+    fprintf(stderr, "  [compact] %u/%u clusters allocated (%.1f%% savings)\n",
+            cf->alloc_count, cf->total_clusters,
+            cf->total_clusters > 0 ?
+            (1.0 - (double)cf->alloc_count / cf->total_clusters) * 100.0 : 0.0);
+
+    /* Mark directory clusters (FAT32: start from root_cluster, else from root dir) */
+    if (cf->fat_type == FAT_32 && cf->root_cluster >= 2) {
+        fat_mark_dir_clusters(cf, cf->root_cluster);
+    }
+    /* For FAT12/16, root dir is separate (not in cluster area), scan its entries */
+    if (cf->fat_type != FAT_32 && cf->root_entry_count > 0) {
+        uint32_t root_off_abs = cf->reserved_sectors + cf->num_fats * cf->sectors_per_fat;
+        uint32_t root_size = cf->root_entry_count * DIR_ENTRY_SIZE;
+        uint8_t *root = (uint8_t *)malloc(root_size);
+        if (root) {
+            off_t roff = part_offset + (off_t)root_off_abs * bps;
+            if (lseek(src_fd, roff, SEEK_SET) >= 0 &&
+                read(src_fd, root, root_size) == (ssize_t)root_size) {
+                for (uint32_t i = 0; i < cf->root_entry_count; i++) {
+                    uint8_t *e = &root[i * DIR_ENTRY_SIZE];
+                    if (e[0] == 0x00) break;
+                    if (e[0] == 0xE5 || e[11] == ATTR_LONG_NAME) continue;
+                    if (e[11] & ATTR_VOLUME_ID) continue;
+                    if (e[11] & ATTR_DIRECTORY) {
+                        uint32_t sub = (uint32_t)(e[26] | (e[27]<<8));
+                        if (e[0] == '.' && (e[1] == ' ' || e[1] == '.')) continue;
+                        if (sub >= 2) fat_mark_dir_clusters(cf, sub);
+                    }
+                }
+            }
+            free(root);
+        }
+    }
+
+    /* Build patched boot sector (with updated cluster counts) */
+    cf->boot_size = cf->reserved_sectors * bps;
+    cf->boot_sector = (uint8_t *)malloc(cf->boot_size);
+    if (lseek(src_fd, part_offset, SEEK_SET) >= 0)
+        read(src_fd, cf->boot_sector, cf->boot_size);
+
+    /* Recalculate sectors_per_fat for compacted size */
+    uint32_t new_data_sectors = cf->alloc_count * spc;
+    uint32_t new_spf;
+    if (cf->fat_type == FAT_32) {
+        /* entries * 4 bytes / bps, round up */
+        new_spf = ((cf->alloc_count + 2) * 4 + bps - 1) / bps;
+    } else if (cf->fat_type == FAT_16) {
+        new_spf = ((cf->alloc_count + 2) * 2 + bps - 1) / bps;
+    } else {
+        new_spf = (((cf->alloc_count + 2) * 3 + 1) / 2 + bps - 1) / bps;
+    }
+
+    uint32_t new_total = cf->reserved_sectors + cf->num_fats * new_spf +
+                          cf->root_dir_sectors + new_data_sectors;
+
+    /* Patch BPB in boot sector */
+    if (new_total <= 0xFFFF) {
+        cf->boot_sector[19] = new_total & 0xFF;
+        cf->boot_sector[20] = (new_total >> 8) & 0xFF;
+        cf->boot_sector[32] = 0; cf->boot_sector[33] = 0;
+        cf->boot_sector[34] = 0; cf->boot_sector[35] = 0;
+    } else {
+        cf->boot_sector[19] = 0; cf->boot_sector[20] = 0;
+        cf->boot_sector[32] = new_total & 0xFF;
+        cf->boot_sector[33] = (new_total >> 8) & 0xFF;
+        cf->boot_sector[34] = (new_total >> 16) & 0xFF;
+        cf->boot_sector[35] = (new_total >> 24) & 0xFF;
+    }
+
+    if (cf->fat_type == FAT_32) {
+        cf->boot_sector[36] = new_spf & 0xFF;
+        cf->boot_sector[37] = (new_spf >> 8) & 0xFF;
+        cf->boot_sector[38] = (new_spf >> 16) & 0xFF;
+        cf->boot_sector[39] = (new_spf >> 24) & 0xFF;
+        /* Patch root cluster if it was remapped */
+        if (cf->root_cluster < cf->old_to_new_size && cf->old_to_new[cf->root_cluster]) {
+            uint32_t nr = cf->old_to_new[cf->root_cluster];
+            cf->boot_sector[44] = nr & 0xFF;
+            cf->boot_sector[45] = (nr >> 8) & 0xFF;
+            cf->boot_sector[46] = (nr >> 16) & 0xFF;
+            cf->boot_sector[47] = (nr >> 24) & 0xFF;
+        }
+    } else {
+        cf->boot_sector[22] = new_spf & 0xFF;
+        cf->boot_sector[23] = (new_spf >> 8) & 0xFF;
+    }
+
+    /* Build new FAT table */
+    cf->new_fat_size = new_spf * bps * cf->num_fats;
+    cf->new_fat = (uint8_t *)calloc(1, cf->new_fat_size);
+
+    uint32_t one_fat_size = new_spf * bps;
+    /* Entry 0: media byte */
+    if (cf->fat_type == FAT_32)
+        fat_write_entry(cf->new_fat, 0, 0x0FFFFF00 | bpb[21], FAT_32);
+    else if (cf->fat_type == FAT_16)
+        fat_write_entry(cf->new_fat, 0, 0xFF00 | bpb[21], FAT_16);
+    else
+        fat_write_entry(cf->new_fat, 0, 0x0F00 | bpb[21], FAT_12);
+
+    /* Entry 1: EOC with clean shutdown */
+    if (cf->fat_type == FAT_32)
+        fat_write_entry(cf->new_fat, 1, 0x0FFFFFFF, FAT_32);
+    else if (cf->fat_type == FAT_16)
+        fat_write_entry(cf->new_fat, 1, 0xFFFF, FAT_16);
+    else
+        fat_write_entry(cf->new_fat, 1, 0x0FFF, FAT_12);
+
+    /* Remap cluster chains */
+    for (uint32_t i = 0; i < cf->alloc_count; i++) {
+        uint32_t old_c = cf->allocated[i];
+        uint32_t new_c = i + 2;
+        uint32_t old_next = fat_read_entry(cf->fat_data, old_c, cf->fat_type);
+
+        if (fat_is_eoc(old_next, cf->fat_type)) {
+            /* End of chain */
+            if (cf->fat_type == FAT_32)
+                fat_write_entry(cf->new_fat, new_c, 0x0FFFFFFF, FAT_32);
+            else if (cf->fat_type == FAT_16)
+                fat_write_entry(cf->new_fat, new_c, 0xFFFF, FAT_16);
+            else
+                fat_write_entry(cf->new_fat, new_c, 0x0FFF, FAT_12);
+        } else if (old_next >= 2 && old_next < cf->old_to_new_size &&
+                   cf->old_to_new[old_next]) {
+            fat_write_entry(cf->new_fat, new_c, cf->old_to_new[old_next], cf->fat_type);
+        } else {
+            /* Broken chain — mark as EOC */
+            if (cf->fat_type == FAT_32)
+                fat_write_entry(cf->new_fat, new_c, 0x0FFFFFFF, FAT_32);
+            else if (cf->fat_type == FAT_16)
+                fat_write_entry(cf->new_fat, new_c, 0xFFFF, FAT_16);
+            else
+                fat_write_entry(cf->new_fat, new_c, 0x0FFF, FAT_12);
+        }
+    }
+
+    /* Copy FAT to all copies */
+    for (int f = 1; f < cf->num_fats; f++)
+        memcpy(cf->new_fat + f * one_fat_size, cf->new_fat, one_fat_size);
+
+    /* Build root directory for FAT12/16 */
+    if (cf->fat_type != FAT_32 && cf->root_dir_sectors > 0) {
+        cf->root_dir_size = cf->root_dir_sectors * bps;
+        cf->root_dir = (uint8_t *)malloc(cf->root_dir_size);
+        off_t roff = part_offset + (off_t)(cf->reserved_sectors +
+            cf->num_fats * cf->sectors_per_fat) * bps;
+        if (lseek(src_fd, roff, SEEK_SET) >= 0)
+            read(src_fd, cf->root_dir, cf->root_dir_size);
+        /* Patch directory entries in root */
+        fat_patch_dir_entries(cf, cf->root_dir, cf->root_dir_size);
+    }
+
+    /* Calculate total output size */
+    cf->total_output_size = (uint64_t)cf->boot_size + cf->new_fat_size +
+        (cf->root_dir ? cf->root_dir_size : 0) +
+        (uint64_t)cf->alloc_count * cf->cluster_size;
+
+    cf->position = 0;
+    cf->cluster_buf = (uint8_t *)malloc(cf->cluster_size);
+    cf->cached_cluster = -1;
+
+    fprintf(stderr, "  [compact] Output: %llu bytes (was %llu, saved %llu)\n",
+            (unsigned long long)cf->total_output_size,
+            (unsigned long long)part_size,
+            (unsigned long long)(part_size - cf->total_output_size));
+
+    return cf;
+}
+
+/* Read from compacted stream — returns bytes read (0 = EOF) */
+static ssize_t compact_fat_read(CompactFat *cf, uint8_t *buf, size_t count) {
+    if (cf->position >= cf->total_output_size) return 0;
+    if (cf->position + count > cf->total_output_size)
+        count = cf->total_output_size - cf->position;
+
+    size_t filled = 0;
+    while (filled < count) {
+        uint64_t pos = cf->position + filled;
+        size_t remaining = count - filled;
+
+        /* Region 1: Boot sector / reserved */
+        if (pos < cf->boot_size) {
+            size_t off = (size_t)pos;
+            size_t n = cf->boot_size - off;
+            if (n > remaining) n = remaining;
+            memcpy(buf + filled, cf->boot_sector + off, n);
+            filled += n;
+            continue;
+        }
+
+        /* Region 2: FAT tables */
+        uint64_t fat_start = cf->boot_size;
+        uint64_t fat_end = fat_start + cf->new_fat_size;
+        if (pos < fat_end) {
+            size_t off = (size_t)(pos - fat_start);
+            size_t n = (size_t)(fat_end - pos);
+            if (n > remaining) n = remaining;
+            memcpy(buf + filled, cf->new_fat + off, n);
+            filled += n;
+            continue;
+        }
+
+        /* Region 3: Root directory (FAT12/16 only) */
+        uint64_t root_start = fat_end;
+        uint64_t root_end = root_start + (cf->root_dir ? cf->root_dir_size : 0);
+        if (cf->root_dir && pos < root_end) {
+            size_t off = (size_t)(pos - root_start);
+            size_t n = (size_t)(root_end - pos);
+            if (n > remaining) n = remaining;
+            memcpy(buf + filled, cf->root_dir + off, n);
+            filled += n;
+            continue;
+        }
+
+        /* Region 4: Data clusters */
+        uint64_t data_start = root_end;
+        size_t rel = (size_t)(pos - data_start);
+        uint32_t cidx = rel / cf->cluster_size;
+        size_t coff = rel % cf->cluster_size;
+
+        if (cidx >= cf->alloc_count) {
+            /* Beyond mapped clusters — zero fill */
+            size_t n = cf->cluster_size - coff;
+            if (n > remaining) n = remaining;
+            memset(buf + filled, 0, n);
+            filled += n;
+            continue;
+        }
+
+        /* Load cluster from source if not cached */
+        if (cf->cached_cluster != (int)cidx) {
+            uint32_t old_c = cf->allocated[cidx];
+            off_t src_off = cf->part_offset +
+                (off_t)(cf->data_start_sector + (old_c - 2) * cf->sectors_per_cluster)
+                * cf->bytes_per_sector;
+            lseek(cf->src_fd, src_off, SEEK_SET);
+            read(cf->src_fd, cf->cluster_buf, cf->cluster_size);
+
+            /* Patch directory entries if this is a directory cluster */
+            if (old_c < (uint32_t)(cf->total_clusters + 2) && cf->is_dir_cluster[old_c])
+                fat_patch_dir_entries(cf, cf->cluster_buf, cf->cluster_size);
+
+            cf->cached_cluster = (int)cidx;
+        }
+
+        size_t n = cf->cluster_size - coff;
+        if (n > remaining) n = remaining;
+        memcpy(buf + filled, cf->cluster_buf + coff, n);
+        filled += n;
+    }
+
+    cf->position += filled;
+    return (ssize_t)filled;
+}
+
+static void compact_fat_close(CompactFat *cf) {
+    if (!cf) return;
+    free(cf->fat_data);
+    free(cf->allocated);
+    free(cf->old_to_new);
+    free(cf->is_dir_cluster);
+    free(cf->boot_sector);
+    free(cf->new_fat);
+    free(cf->root_dir);
+    free(cf->cluster_buf);
+    free(cf);
+}
+
+/* Check if a partition type byte is FAT */
+static int is_fat_type(uint8_t type) {
+    switch (type) {
+        case 0x01: case 0x04: case 0x06: case 0x0B: case 0x0C:
+        case 0x0E: case 0x11: case 0x14: case 0x16: case 0x1B:
+        case 0x1C: case 0x1E:
+            return 1;
+        default:
+            return 0;
+    }
+}
+
+/* ============================================================
  * JSON Metadata Writer
  * ============================================================ */
 
@@ -740,7 +1426,8 @@ static void write_metadata_json(const char *backup_path, const char *source,
         if (parts[i].is_extended) continue;
 
         char filename[128];
-        snprintf(filename, sizeof(filename), "partition-%d.raw", parts[i].index);
+        const char *_ext = (strcmp(compression, "gzip") == 0) ? ".gz" : ".raw";
+        snprintf(filename, sizeof(filename), "partition-%d%s", parts[i].index, _ext);
 
         fprintf(f, "    {\n");
         fprintf(f, "      \"index\": %d,\n", parts[i].index);
@@ -791,8 +1478,9 @@ static int cmd_backup(int argc, char **argv) {
             "  --source <PATH>        Source device or image file (required)\n"
             "  --dest <PATH>          Destination directory (required)\n"
             "  --name <NAME>          Backup name (default: backup)\n"
-            "  --compression <TYPE>   raw (default on Tiger)\n"
-            "  --sector-by-sector     Full sector-by-sector backup\n"
+            "  --compression <TYPE>   raw (default) or gzip\n"
+            "  --checksum <TYPE>      none (default), crc32, or sha1\n"
+            "  --sector-by-sector     Full sector-by-sector (no FAT compaction)\n"
         );
         return 0;
     }
@@ -800,6 +1488,8 @@ static int cmd_backup(int argc, char **argv) {
     const char *source = flag_value(argc, argv, "--source");
     const char *dest = flag_value(argc, argv, "--dest");
     const char *name = flag_value(argc, argv, "--name");
+    const char *comp_str = flag_value(argc, argv, "--compression");
+    const char *cksum_str = flag_value(argc, argv, "--checksum");
     int sector_by_sector = has_flag(argc, argv, "--sector-by-sector");
 
     if (!source || !dest) {
@@ -808,6 +1498,15 @@ static int cmd_backup(int argc, char **argv) {
         return 1;
     }
     if (!name) name = "backup";
+
+    CompressionMode compression = COMP_RAW;
+    if (comp_str && strcmp(comp_str, "gzip") == 0) compression = COMP_GZIP;
+
+    ChecksumType checksum = CKSUM_NONE;
+    if (cksum_str) {
+        if (strcmp(cksum_str, "crc32") == 0) checksum = CKSUM_CRC32;
+        else if (strcmp(cksum_str, "sha1") == 0) checksum = CKSUM_SHA1;
+    }
 
     /* Open source */
     int src_fd = open(source, O_RDONLY);
@@ -830,6 +1529,10 @@ static int cmd_backup(int argc, char **argv) {
     char sz_buf[32];
     fprintf(stderr, "Source: %s (%s)\n", source,
             format_bytes(source_size, sz_buf, sizeof(sz_buf)));
+    fprintf(stderr, "Compression: %s | Checksum: %s | Compact: %s\n",
+            compression == COMP_GZIP ? "gzip" : "raw",
+            checksum == CKSUM_CRC32 ? "crc32" : checksum == CKSUM_SHA1 ? "sha1" : "none",
+            sector_by_sector ? "off (sector-by-sector)" : "FAT-aware");
 
     /* Detect partition table */
     PartTable pt;
@@ -878,37 +1581,54 @@ static int cmd_backup(int argc, char **argv) {
     uint8_t *buf = (uint8_t *)malloc(CHUNK_SIZE);
     if (!buf) { fprintf(stderr, "Out of memory\n"); close(src_fd); return 1; }
 
-    uint64_t *imaged_sizes = (uint64_t *)calloc(part_count, sizeof(uint64_t));
+    uint64_t *imaged_sizes = (uint64_t *)calloc(part_count + 1, sizeof(uint64_t));
+    char checksums[MAX_PARTITIONS][128];
+    memset(checksums, 0, sizeof(checksums));
+
+    const char *comp_name = compression == COMP_GZIP ? "gzip" : "raw";
+    const char *cksum_name = checksum == CKSUM_CRC32 ? "crc32" :
+                              checksum == CKSUM_SHA1 ? "sha1" : "none";
 
     if (part_count == 0 && pt.type == PT_NONE) {
         /* Superfloppy: back up entire device as one partition */
+        const char *ext = compression == COMP_GZIP ? ".gz" : ".raw";
         char out_path[MAX_PATH_LEN];
-        snprintf(out_path, sizeof(out_path), "%s/partition-0.raw", backup_path);
-
-        FILE *out = fopen(out_path, "wb");
-        if (!out) {
-            fprintf(stderr, "Error: Cannot create %s\n", out_path);
-            free(buf); close(src_fd); return 1;
-        }
+        snprintf(out_path, sizeof(out_path), "%s/partition-0%s", backup_path, ext);
 
         fprintf(stderr, "Backing up entire %s image...\n", pt.fs_hint);
         lseek(src_fd, 0, SEEK_SET);
 
         uint64_t written = 0;
-        ssize_t nr;
-        while ((nr = read(src_fd, buf, CHUNK_SIZE)) > 0) {
-            fwrite(buf, 1, nr, out);
-            written += nr;
-            if (source_size > 0) {
-                double pct = (double)written / source_size * 100.0;
-                draw_progress(pct, pt.fs_hint);
+        if (compression == COMP_GZIP) {
+            gzFile gz = gzopen(out_path, "wb9");
+            if (!gz) { fprintf(stderr, "Error: Cannot create %s\n", out_path); free(buf); close(src_fd); return 1; }
+            ssize_t nr;
+            while ((nr = read(src_fd, buf, CHUNK_SIZE)) > 0) {
+                gzwrite(gz, buf, nr);
+                written += nr;
+                if (source_size > 0) draw_progress((double)written / source_size * 100.0, pt.fs_hint);
             }
+            gzclose(gz);
+        } else {
+            FILE *out = fopen(out_path, "wb");
+            if (!out) { fprintf(stderr, "Error: Cannot create %s\n", out_path); free(buf); close(src_fd); return 1; }
+            ssize_t nr;
+            while ((nr = read(src_fd, buf, CHUNK_SIZE)) > 0) {
+                fwrite(buf, 1, nr, out);
+                written += nr;
+                if (source_size > 0) draw_progress((double)written / source_size * 100.0, pt.fs_hint);
+            }
+            fclose(out);
         }
-        fclose(out);
-        fprintf(stderr, "\n[INFO] Wrote %llu bytes to partition-0.raw\n",
-                (unsigned long long)written);
+        fprintf(stderr, "\n");
 
-        /* Create a fake partition entry for metadata */
+        /* Checksum */
+        if (checksum != CKSUM_NONE) {
+            fprintf(stderr, "[INFO] Computing checksum...\n");
+            write_checksum(out_path, checksum, checksums[0], sizeof(checksums[0]));
+            fprintf(stderr, "[INFO] %s: %s\n", cksum_name, checksums[0]);
+        }
+
         parts[0].index = 0;
         strcpy(parts[0].type_name, pt.fs_hint);
         parts[0].start_lba = 0;
@@ -922,16 +1642,6 @@ static int cmd_backup(int argc, char **argv) {
                 continue;
             }
 
-            char out_path[MAX_PATH_LEN];
-            snprintf(out_path, sizeof(out_path), "%s/partition-%d.raw",
-                     backup_path, parts[i].index);
-
-            FILE *out = fopen(out_path, "wb");
-            if (!out) {
-                fprintf(stderr, "Error: Cannot create %s\n", out_path);
-                continue;
-            }
-
             uint64_t part_size = parts[i].total_sectors * SECTOR_SIZE;
             off_t part_offset = (off_t)parts[i].start_lba * SECTOR_SIZE;
 
@@ -940,23 +1650,83 @@ static int cmd_backup(int argc, char **argv) {
             fprintf(stderr, "Backing up partition %d (%s, %s)...\n",
                     parts[i].index, parts[i].type_name, psz);
 
-            lseek(src_fd, part_offset, SEEK_SET);
-
-            uint64_t remaining = part_size;
-            uint64_t written = 0;
-            while (remaining > 0) {
-                size_t to_read = remaining > CHUNK_SIZE ? CHUNK_SIZE : (size_t)remaining;
-                ssize_t nr = read(src_fd, buf, to_read);
-                if (nr <= 0) break;
-                fwrite(buf, 1, nr, out);
-                written += nr;
-                remaining -= nr;
-                double pct = (double)written / part_size * 100.0;
-                draw_progress(pct, parts[i].type_name);
+            /* Try FAT compaction (unless --sector-by-sector) */
+            CompactFat *cf = NULL;
+            if (!sector_by_sector && is_fat_type(parts[i].type_byte)) {
+                cf = compact_fat_open(src_fd, part_offset, part_size);
             }
-            fclose(out);
+
+            const char *ext = compression == COMP_GZIP ? ".gz" : ".raw";
+            char out_path[MAX_PATH_LEN];
+            snprintf(out_path, sizeof(out_path), "%s/partition-%d%s",
+                     backup_path, parts[i].index, ext);
+
+            uint64_t total_to_write = cf ? cf->total_output_size : part_size;
+            uint64_t written = 0;
+
+            if (compression == COMP_GZIP) {
+                gzFile gz = gzopen(out_path, "wb9");
+                if (!gz) { fprintf(stderr, "Error: Cannot create %s\n", out_path); compact_fat_close(cf); continue; }
+
+                if (cf) {
+                    ssize_t nr;
+                    while ((nr = compact_fat_read(cf, buf, CHUNK_SIZE)) > 0) {
+                        gzwrite(gz, buf, nr);
+                        written += nr;
+                        draw_progress((double)written / total_to_write * 100.0, "compact+gz");
+                    }
+                } else {
+                    lseek(src_fd, part_offset, SEEK_SET);
+                    uint64_t remaining = part_size;
+                    while (remaining > 0) {
+                        size_t to_read = remaining > CHUNK_SIZE ? CHUNK_SIZE : (size_t)remaining;
+                        ssize_t nr = read(src_fd, buf, to_read);
+                        if (nr <= 0) break;
+                        gzwrite(gz, buf, nr);
+                        written += nr;
+                        remaining -= nr;
+                        draw_progress((double)written / part_size * 100.0, "gzip");
+                    }
+                }
+                gzclose(gz);
+            } else {
+                FILE *out = fopen(out_path, "wb");
+                if (!out) { fprintf(stderr, "Error: Cannot create %s\n", out_path); compact_fat_close(cf); continue; }
+
+                if (cf) {
+                    ssize_t nr;
+                    while ((nr = compact_fat_read(cf, buf, CHUNK_SIZE)) > 0) {
+                        fwrite(buf, 1, nr, out);
+                        written += nr;
+                        draw_progress((double)written / total_to_write * 100.0, "compact");
+                    }
+                } else {
+                    lseek(src_fd, part_offset, SEEK_SET);
+                    uint64_t remaining = part_size;
+                    while (remaining > 0) {
+                        size_t to_read = remaining > CHUNK_SIZE ? CHUNK_SIZE : (size_t)remaining;
+                        ssize_t nr = read(src_fd, buf, to_read);
+                        if (nr <= 0) break;
+                        fwrite(buf, 1, nr, out);
+                        written += nr;
+                        remaining -= nr;
+                        draw_progress((double)written / part_size * 100.0, parts[i].type_name);
+                    }
+                }
+                fclose(out);
+            }
+
             imaged_sizes[i] = written;
+            compact_fat_close(cf);
             fprintf(stderr, "\n");
+
+            /* Checksum */
+            if (checksum != CKSUM_NONE) {
+                fprintf(stderr, "[INFO] Computing %s for partition-%d...\n",
+                        cksum_name, parts[i].index);
+                write_checksum(out_path, checksum, checksums[i], sizeof(checksums[i]));
+                fprintf(stderr, "[INFO] %s: %s\n", cksum_name, checksums[i]);
+            }
         }
     }
 
@@ -964,7 +1734,7 @@ static int cmd_backup(int argc, char **argv) {
 
     /* Write metadata.json */
     write_metadata_json(backup_path, source, source_size, &pt,
-                        parts, part_count, "raw", "none",
+                        parts, part_count, comp_name, cksum_name,
                         sector_by_sector, imaged_sizes);
     fprintf(stderr, "[INFO] Wrote metadata.json\n");
 
@@ -1093,8 +1863,14 @@ static int cmd_restore(int argc, char **argv) {
             restorable[restore_count].index = idx;
             restorable[restore_count].start_lba = slba;
             restorable[restore_count].size = isize;
+            /* Try .gz first, then .raw */
             snprintf(restorable[restore_count].filename, 128,
-                     "%s/partition-%d.raw", backup_dir, idx);
+                     "%s/partition-%d.gz", backup_dir, idx);
+            struct stat _rs;
+            if (stat(restorable[restore_count].filename, &_rs) != 0) {
+                snprintf(restorable[restore_count].filename, 128,
+                         "%s/partition-%d.raw", backup_dir, idx);
+            }
             restore_count++;
         }
 
@@ -1104,35 +1880,54 @@ static int cmd_restore(int argc, char **argv) {
     fprintf(stderr, "Restoring %d partition(s) to %s\n\n", restore_count, target);
 
     for (int i = 0; i < restore_count; i++) {
-        FILE *pf = fopen(restorable[i].filename, "rb");
-        if (!pf) {
-            fprintf(stderr, "[WARN] Cannot open %s, skipping\n", restorable[i].filename);
-            continue;
-        }
+        const char *fname = restorable[i].filename;
+        int is_gz = (strlen(fname) > 3 && strcmp(fname + strlen(fname) - 3, ".gz") == 0);
 
         /* Seek to partition offset in target */
         off_t offset = (off_t)restorable[i].start_lba * SECTOR_SIZE;
         lseek(tgt_fd, offset, SEEK_SET);
 
-        fprintf(stderr, "Restoring partition %d to LBA %llu...\n",
-                restorable[i].index, (unsigned long long)restorable[i].start_lba);
-
-        /* Get file size */
-        fseek(pf, 0, SEEK_END);
-        uint64_t file_size = ftell(pf);
-        fseek(pf, 0, SEEK_SET);
+        fprintf(stderr, "Restoring partition %d to LBA %llu%s...\n",
+                restorable[i].index, (unsigned long long)restorable[i].start_lba,
+                is_gz ? " (decompressing)" : "");
 
         uint64_t written = 0;
-        size_t nr;
-        while ((nr = fread(buf, 1, CHUNK_SIZE, pf)) > 0) {
-            write(tgt_fd, buf, nr);
-            written += nr;
-            if (file_size > 0) {
-                double pct = (double)written / file_size * 100.0;
-                draw_progress(pct, "Restoring");
+
+        if (is_gz) {
+            gzFile gz = gzopen(fname, "rb");
+            if (!gz) {
+                fprintf(stderr, "[WARN] Cannot open %s, skipping\n", fname);
+                continue;
             }
+            int nr;
+            while ((nr = gzread(gz, buf, CHUNK_SIZE)) > 0) {
+                write(tgt_fd, buf, nr);
+                written += nr;
+                if (restorable[i].size > 0) {
+                    draw_progress((double)written / restorable[i].size * 100.0, "Restoring");
+                }
+            }
+            gzclose(gz);
+        } else {
+            FILE *pf = fopen(fname, "rb");
+            if (!pf) {
+                fprintf(stderr, "[WARN] Cannot open %s, skipping\n", fname);
+                continue;
+            }
+            fseek(pf, 0, SEEK_END);
+            uint64_t file_size = ftell(pf);
+            fseek(pf, 0, SEEK_SET);
+
+            size_t nr;
+            while ((nr = fread(buf, 1, CHUNK_SIZE, pf)) > 0) {
+                write(tgt_fd, buf, nr);
+                written += nr;
+                if (file_size > 0) {
+                    draw_progress((double)written / file_size * 100.0, "Restoring");
+                }
+            }
+            fclose(pf);
         }
-        fclose(pf);
         fprintf(stderr, "\n[INFO] Wrote %llu bytes\n", (unsigned long long)written);
     }
 
@@ -1444,9 +2239,9 @@ int main(int argc, char **argv) {
         print_usage(av[0]);
         return 0;
     } else if (strcmp(cmd, "--version") == 0 || strcmp(cmd, "-V") == 0) {
-        printf("rusty-backup 0.2.0-ppc (transpiled from Rust by rust-ppc-tiger)\n");
+        printf("rusty-backup 0.3.0-ppc (transpiled from Rust by rust-ppc-tiger)\n");
         printf("Platform: Mac OS X Tiger PowerPC\n");
-        printf("Features: MBR, APM, EBR chain, raw backup/restore\n");
+        printf("Features: MBR, APM, EBR chain, gzip, CRC32, SHA-1, FAT compaction\n");
         return 0;
     } else {
         fprintf(stderr, "Unknown subcommand: %s\n", cmd);
