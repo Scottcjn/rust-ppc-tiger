@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple Computer//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleName</key>
+    <string>Rusty Backup</string>
+    <key>CFBundleDisplayName</key>
+    <string>Rusty Backup</string>
+    <key>CFBundleIdentifier</key>
+    <string>com.elyanlabs.rustybackup</string>
+    <key>CFBundleVersion</key>
+    <string>0.2.0</string>
+    <key>CFBundleShortVersionString</key>
+    <string>0.2.0-ppc</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleSignature</key>
+    <string>RsBk</string>
+    <key>CFBundleExecutable</key>
+    <string>RustyBackup</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>10.4.0</string>
+    <key>NSHumanReadableCopyright</key>
+    <string>Transpiled from Rust by rust-ppc-tiger. AGPL-3.0.</string>
+</dict>
+</plist>
