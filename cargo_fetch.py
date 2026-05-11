@@ -291,10 +291,14 @@ def parse_crate_features(crate_dir):
                 continue
 
             if section == 'features':
-                m = re.match(r'^(\w[\w-]*)\s*=\s*\[(.+)\]', line)
+                m = re.match(r'^(\w[\w-]*)\s*=\s*\[(.*)\]', line)
                 if m:
                     feat_name = m.group(1)
-                    feat_deps = [s.strip().strip('"').strip("'") for s in m.group(2).split(',')]
+                    feat_deps = [
+                        s.strip().strip('"').strip("'")
+                        for s in m.group(2).split(',')
+                        if s.strip()
+                    ]
                     features[feat_name] = feat_deps
 
             elif section in ('dependencies', 'dev-dependencies', 'build-dependencies'):
