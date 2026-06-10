@@ -1,0 +1,44 @@
+[Unit]
+Description=Sophia Elya LLM Server (Protected)
+Documentation=https://github.com/ggml-org/llama.cpp
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=sophia
+Group=sophia
+WorkingDirectory=/home/sophia/llama.cpp/build-pse-collapse
+
+# Resource protection - don't starve RustChain or SSH
+Nice=10
+CPUQuota=75%
+MemoryMax=400G
+TasksMax=100
+
+# Environment
+Environment="OMP_NUM_THREADS=96"
+Environment="OMP_PROC_BIND=spread"
+Environment="OMP_PLACES=cores"
+
+# The command - using numactl to reserve node 3 for mining
+ExecStart=/usr/bin/numactl --cpunodebind=0,1,2 --membind=0,1,2 \
+    /home/sophia/llama.cpp/build-pse-collapse/bin/llama-server \
+    --model /mnt/nvme/gpt-oss-120b/gpt-oss-120b-mxfp4-00001-of-00003.gguf \
+    --host 0.0.0.0 \
+    --port 8080 \
+    --threads 96 \
+    --ctx-size 4096 \
+    --parallel 4 \
+    --no-mmap
+
+# Restart policy
+Restart=on-failure
+RestartSec=30
+
+# Logging
+StandardOutput=append:/var/log/sophia-server.log
+StandardError=append:/var/log/sophia-server.log
+
+[Install]
+WantedBy=multi-user.target
